@@ -6,6 +6,7 @@ and generating playlist recommendations using the trained SetTransformer model.
 """
 import pandas as pd
 import tensorflow as tf
+import tensorflow_hub as hub
 import numpy as np
 import os
 import datetime
@@ -15,11 +16,10 @@ import pickle
 from src.model import PlaylistModel, build_song_encoder
 from src.train import encode_title
 
-
 # Load data
 print("Reading CSV (this may take a while)...")
 start = time.perf_counter()
-playlists = pd.read_csv("playlist_song_features_FINAL_FULL.csv", nrows=10000, engine="pyarrow")
+playlists = pd.read_csv("playlist_song_features_FINAL_FULL.csv", engine="pyarrow")
 print(f'read_csv took {start - time.perf_counter()}')
 
 # Fix NaNs to match training preprocessing
@@ -52,9 +52,12 @@ print(f"Vocab Reconstructed. Size: {VOCAB_SIZE}")
 # Load feature columns
 print("⏳ Loading feature column list used during training...")
 import pickle
-with open("data/feature_cols.pkl", "rb") as f:
-    feature_cols = pickle.load(f)
-print(f"Loaded {len(feature_cols)} feature columns (must match training exactly).")
+
+feature_cols = [
+        "danceability","energy","key","loudness","mode", "year_filled","popularity_filled","explicit_filled", "year_is_missing","popularity_is_missing", "explicit_is_missing", # ------------- removed popularity -------------------
+        "speechiness","acousticness","instrumentalness","liveness",
+        "valence","tempo","duration_ms","time_signature", 
+] + [c for c in playlists.columns if c.startswith("genre_")] # Add all genre columns
 
 # Reconstruct feature matrix
 print("⏳ Reconstructing Feature Dictionary with TRAINING columns...")
@@ -93,11 +96,13 @@ def encode_title(title_texts):
     return USE(title_texts)
 
 print("⏳ Initializing Model...")
-EMB_DIM = 128
+EMB_DIM = 64
+PLAYLIST_REPRESENTATION_SZ = 64
 model = PlaylistModel(
     num_songs=VOCAB_SIZE,
     song_feat_dim=FEATURE_DIM,
-    emb_dim=EMB_DIM
+    emb_dim=EMB_DIM,
+    playlist_representation_sz=PLAYLIST_REPRESENTATION_SZ
 )
 
 # Build the model graph with a dummy call
