@@ -1,5 +1,9 @@
-"""Preprocess [FINAL - 4 Dataset, Batched Playlists].py"""
+"""
+Data Acquisition and Preprocessing Pipeline
 
+This module handles downloading playlist data from Kaggle, loading and processing
+CSV files, extracting audio features, and preparing the data for model training.
+"""
 import kagglehub
 import os
 import pandas as pd
@@ -9,10 +13,6 @@ import re
 import tensorflow as tf
 import gc
 from pathlib import Path
-
-# -----------------------------
-#  PREPARE HELPER-FUNCTIONS
-# -----------------------------
 
 # Core numeric features we care about
 core_features = [
@@ -70,10 +70,7 @@ def align_to_canonical(df):
             df[col] = pd.NA
     return df[canonical_cols]
 
-# -----------------------------
-# DOWNLOAD & EXTRACT SONGS
-# -----------------------------
-
+# Download datasets from Kaggle
 # 1) 12M songs
 path_12m = kagglehub.dataset_download("rodolfofigueroa/spotify-12m-songs")
 print("12M path:", path_12m)
@@ -90,11 +87,11 @@ print("600k path:", path_600k)
 path_1m = kagglehub.dataset_download("amitanshjoshi/spotify-1million-tracks")
 print("1M path:", path_1m)
 
-# Known / discovered CSV paths
-csv_12m = os.path.join(path_12m, "tracks_features.csv")  # known name
-csv_114k = find_first_csv(path_114k)                     # dataset.csv
-csv_600k = os.path.join(path_600k, "tracks.csv")         # known name
-csv_1m   = find_first_csv(path_1m)                       # spotify_data.csv
+# Construct CSV paths
+csv_12m = os.path.join(path_12m, "tracks_features.csv")
+csv_114k = find_first_csv(path_114k)
+csv_600k = os.path.join(path_600k, "tracks.csv")
+csv_1m   = find_first_csv(path_1m)
 
 print("\nCSV paths:")
 print("12M :", csv_12m)
@@ -102,11 +99,8 @@ print("114k:", csv_114k)
 print("600k:", csv_600k)
 print("1M  :", csv_1m)
 
-# -----------------------------------------------
-# STANDARDIZE SONGS & FILL IN OPTIONAL COLUMNS
-# -----------------------------------------------
-
-# ---- Dataset 1: 12M ----
+# Standardize songs and fill columns
+# Load 12M dataset
 df1 = pd.read_csv(csv_12m)
 
 df1 = df1.rename(columns={"id": "track_id", "name": "track_name"})
@@ -130,7 +124,7 @@ cols_df1 = [
 df1 = df1[[c for c in cols_df1 if c in df1.columns]]
 df1 = align_to_canonical(df1)
 
-# ---- Dataset 2: 114k ----
+# Load 114k dataset
 df2 = pd.read_csv(csv_114k)
 
 df2["track_id"] = df2["track_id"].astype(str)
@@ -152,19 +146,19 @@ cols_df2 = [
 df2 = df2[[c for c in cols_df2 if c in df2.columns]]
 df2 = align_to_canonical(df2)
 
-# ---- Dataset 3: 600k ----
+# Load 600k dataset
 df3 = pd.read_csv(csv_600k)
 
 df3 = df3.rename(columns={"id": "track_id", "name": "track_name"})
 df3["track_id"] = df3["track_id"].astype(str)
 
-# derive year from release_date
+# Extract year from release_date if not present
 if "release_date" in df3.columns:
     df3["year"] = pd.to_datetime(df3["release_date"], errors="coerce").dt.year
 else:
     df3["year"] = pd.NA
 
-# no genre column
+# Genre not present in dataset
 df3["genre"] = pd.NA
 
 # normalize artists -> artist_name
@@ -177,20 +171,18 @@ cols_df3 = [
 df3 = df3[[c for c in cols_df3 if c in df3.columns]]
 df3 = align_to_canonical(df3)
 
-# ---- Dataset 4: 1M ----
+# Load 1M dataset
 df4 = pd.read_csv(csv_1m)
 
 df4["track_id"] = df4["track_id"].astype(str)
 
-# 1M has genre, year, popularity
+# Set missing columns to NA
 if "genre" not in df4.columns:
     df4["genre"] = pd.NA
 if "year" not in df4.columns:
     df4["year"] = pd.NA
 if "popularity" not in df4.columns:
     df4["popularity"] = pd.NA
-
-# 1M has no explicit -> set NaN (optional feature)
 if "explicit" not in df4.columns:
     df4["explicit"] = pd.NA
 
@@ -210,20 +202,15 @@ print("114k:", df2.shape)
 print("600k:", df3.shape)
 print("1M  :", df4.shape)
 
-# -----------------------------------------------
-# MERGE ALL SONG DATASETS INTO master_tracks
-# -----------------------------------------------
-
-# Prefer 1M > 114k > 600k > 12M when track_id collides
+# Merge all song datasets into master_tracks
+# Merge with priority: 1M > 114k > 600k > 12M
 master_tracks = pd.concat([df4, df2, df3, df1], ignore_index=True)
 
 print("Raw combined rows:", len(master_tracks))
 master_tracks.drop_duplicates(subset=["track_id"], inplace=True)
 print("Unique track_ids in master_tracks:", len(master_tracks))
 
-# ---------------------------------------------------
-# ENFORCE SPOTIFY API CONSTRAINTS (pre-imputation)
-# ---------------------------------------------------
+# Enforce Spotify API constraints (pre-imputation)
 def mask_range(df, col, lower=None, upper=None, allowed_values=None):
     """Helper: mask out-of-range values to NaN."""
     if col not in df.columns:
@@ -239,35 +226,28 @@ def mask_range(df, col, lower=None, upper=None, allowed_values=None):
             s = s.mask(s > upper)
     df[col] = s
 
-# loudness: typical range [-60, 0] dB
+# Clamp loudness to valid dB range
 mask_range(master_tracks, "loudness", lower=-60.0, upper=0.0)
 
-# tempo: anything > 0 is fine, just kill zeros / negatives
-mask_range(master_tracks, "tempo", lower=0.0)  # masks tempo <= 0
+# Remove zero and negative tempos
+mask_range(master_tracks, "tempo", lower=0.0)
 
-# duration_ms: anything > 0 is fine, just kill zeros / negatives
-mask_range(master_tracks, "duration_ms", lower=0)  # masks duration_ms <= 0
+# Remove zero and negative durations
+mask_range(master_tracks, "duration_ms", lower=0)
 
-# year: clamp anything < 1900 up to 1900
+# Clamp years below 1900 to 1900
 if "year" in master_tracks.columns:
     year_numeric = pd.to_numeric(master_tracks["year"], errors="coerce")
-
-    # Clamp all non-missing years below 1900 (including 0, negatives) to 1900
     year_clamped = year_numeric.copy()
     year_clamped.loc[year_clamped.notna() & (year_clamped < 1900)] = 1900
-
     master_tracks["year"] = year_clamped
 
-# time signature - filter to 3 and 7 strictly
+# Clamp time signature to [3, 7] range
 if "time_signature" in master_tracks.columns:
     ts = pd.to_numeric(master_tracks["time_signature"], errors="coerce")
-
-    # For valid values (non-NaN), clamp:
-    # values < 3 → 3, values > 7 → 7
     ts_clamped = ts.copy()
     ts_clamped.loc[ts_clamped < 3] = 3
     ts_clamped.loc[ts_clamped > 7] = 7
-
     master_tracks["time_signature"] = ts_clamped
 
 print("\nMin/max AFTER masking (skip NaNs):")
@@ -281,22 +261,19 @@ for col in ["time_signature", "loudness", "tempo", "duration_ms", "year"]:
             f"NaNs={s.isna().sum()}"
         )
         
-# ----------------------------------------------------------------------
-# NUMERIC CLEANUP + OPTIONAL FEATURE IS_MISSING COLS + GENRE ONE-HOT
-# ----------------------------------------------------------------------
-
+# Numeric cleanup, optional feature columns, and genre one-hot encoding
 numeric_optional = ["year", "popularity", "explicit"]
 
-# 1) Normalize explicit to 0/1/NaN
+# Normalize explicit to 0/1/NaN
 if "explicit" in master_tracks.columns:
     exp = master_tracks["explicit"]
     master_tracks["explicit"] = (
-        exp.map({True: 1, False: 0})   # handle booleans
-           .fillna(exp)               # keep existing 0/1 if already numeric
+        exp.map({True: 1, False: 0})
+           .fillna(exp)
     )
     master_tracks["explicit"] = pd.to_numeric(master_tracks["explicit"], errors="coerce")
 
-# 2) Cast ALL numeric-ish features to float
+# Cast numeric features to float
 numeric_base = core_features + numeric_optional
 for col in numeric_base:
     if col in master_tracks.columns:
@@ -305,27 +282,25 @@ for col in numeric_base:
             errors="coerce"
         ).astype("float64")
 
-# 3) For OPTIONAL numeric features: create *_filled + *_is_missing
+# Create filled and missing indicator columns
 for col in numeric_optional:
     if col not in master_tracks.columns:
         continue
 
     col_float = master_tracks[col]
 
-    # Missing mask: 0 = real value, 1 = missing
+    # Mark missing values
     master_tracks[col + "_is_missing"] = col_float.isna().astype(int)
 
-    # Fill strategy:
+    # Fill missing values
     if col == "explicit":
-        # For explicit, use fixed default: assume not explicit (=0.0)
         fill_val = 0.0
     else:
-        # For year & popularity, use mean imputation
         fill_val = col_float.mean(skipna=True)
 
     master_tracks[col + "_filled"] = col_float.fillna(fill_val)
 
-# 4) One-hot encode genre; NaN → all zeros in dummy columns, as floats
+# One-hot encode genre
 genre_dummies = pd.get_dummies(
     master_tracks["genre"],
     prefix="genre",
@@ -334,15 +309,11 @@ genre_dummies = pd.get_dummies(
 
 master_tracks = pd.concat([master_tracks, genre_dummies], axis=1)
 
-# 5) Drop raw optional columns + raw genre so we only keep *_filled + *_is_missing
+# Drop raw columns, keep only filled and indicator versions
 cols_to_drop = [c for c in ["year", "popularity", "explicit", "genre"] if c in master_tracks.columns]
 master_tracks = master_tracks.drop(columns=cols_to_drop)
 
 print("master_tracks shape after feature engineering:", master_tracks.shape)
-
-# -----------------------------
-# TRACK-LEVEL MIN–MAX NORMALIZATION
-# -----------------------------
 
 # Continuous numeric features to normalize
 optional_numeric_filled = [
@@ -375,10 +346,7 @@ optional_masks = [
 ]
 genre_one_hot_cols = [c for c in master_tracks.columns if c.startswith("genre_")]
 
-# ----------------------------------------------------------------------
-# DOWNLOAD 1-MILLION PLAYLIST & SORT SLICE FILES NUMERICALLY
-# ----------------------------------------------------------------------
-
+# Download 1-million playlist and sort slice files numerically
 mpl_path = kagglehub.dataset_download("himanshuwagh/spotify-million")
 print("Million playlist dataset path:", mpl_path)
 mpl_path = Path(mpl_path)
@@ -389,17 +357,16 @@ slice_files = [p for p in json_files if "mpd.slice." in p.name]
 
 print("Number of slice files before sort:", len(slice_files))
 
-# Regex to pull the numeric start of the range: mpd.slice.1000-1999.json -> 1000
+# Extract numeric start index from slice filename
 pattern = re.compile(r"mpd\.slice\.(\d+)-(\d+)\.json")
 
 def slice_key(path):
     m = pattern.match(path.name)
     if m:
-        return int(m.group(1))  # sort by the starting index
-    # fallback if something weird slips in
+        return int(m.group(1))
     return float("inf")
 
-# Sort numerically by the slice start index
+# Sort slice files by numeric index
 slice_files = sorted(slice_files, key=slice_key)
 
 print("First 5 slice files after numeric sort:")
@@ -410,14 +377,11 @@ print("Last 5 slice files after numeric sort:")
 for p in slice_files[-5:]:
     print(p.name)
 
-# Use ALL slices (1000)
+# Use all available slices
 slice_files_small = slice_files
 print("Total slice files used:", len(slice_files_small))
 
-# ----------------------------------------------------------------------
-# BATCHED FLATTEN + JOIN + FILTER + SAVE
-# ----------------------------------------------------------------------
-
+# Batched flatten, join, filter, and save
 # Features we REQUIRE to be present (for training)
 feature_cols_required = core_features + [
     "year_filled",
@@ -434,7 +398,7 @@ for start_idx in range(0, len(slice_files_small), BATCH_SIZE):
     batch_paths = slice_files_small[start_idx:start_idx + BATCH_SIZE]
     print(f"\nProcessing slice batch {start_idx}–{start_idx + len(batch_paths) - 1} ...")
 
-    # 1) Build a local playlist–track DataFrame for this batch
+    # Build playlist-track dataframe for batch
     rows = []
     for path in batch_paths:
         with open(path, "r", encoding="utf-8") as f:
@@ -445,8 +409,8 @@ for start_idx in range(0, len(slice_files_small), BATCH_SIZE):
             title = pl.get("name", "")
 
             for tr in pl["tracks"]:
-                track_uri = tr["track_uri"]          # e.g. 'spotify:track:4qPNDBW1i3p13qLCt0Ki3A'
-                track_id = track_uri.split(":")[-1]  # '4qPNDBW1i3p13qLCt0Ki3A'
+                track_uri = tr["track_uri"]
+                track_id = track_uri.split(":")[-1]
 
                 rows.append({
                     "playlist_id": pid,
@@ -458,7 +422,7 @@ for start_idx in range(0, len(slice_files_small), BATCH_SIZE):
     pl_batch["track_id"] = pl_batch["track_id"].astype(str)
     print("  batch playlist–track rows:", len(pl_batch))
 
-    # 2) Join with normalized master_tracks
+    # Join with normalized track features
     full_batch = pl_batch.merge(
         master_tracks,
         how="left",
@@ -466,11 +430,11 @@ for start_idx in range(0, len(slice_files_small), BATCH_SIZE):
     )
     print("  joined rows:", len(full_batch))
 
-    # 3) Drop rows with missing required features
+    # Remove rows with missing required features
     filtered_batch = full_batch.dropna(subset=feature_cols_required).copy()
     print("  kept rows after dropna:", len(filtered_batch))
 
-    # 4) Reorder / keep only the columns you care about for the model
+    # Select and reorder columns
     cols_for_output = (
         ["playlist_id", "playlist_name", "track_id", "track_name", "artist_name"] +
         feature_cols_required +
@@ -480,7 +444,7 @@ for start_idx in range(0, len(slice_files_small), BATCH_SIZE):
     cols_for_output = [c for c in cols_for_output if c in filtered_batch.columns]
     filtered_batch = filtered_batch[cols_for_output]
 
-    # 5) Append to CSV on disk
+    # Append batch to output file
     filtered_batch.to_csv(
         out_path,
         mode="w" if first_batch else "a",
@@ -491,10 +455,9 @@ for start_idx in range(0, len(slice_files_small), BATCH_SIZE):
     total_rows_written += len(filtered_batch)
     print(f"  wrote {len(filtered_batch)} rows (total so far: {total_rows_written})")
 
-    # 6) Free memory
+    # Free memory
     del rows, pl_batch, full_batch, filtered_batch
     gc.collect()
-
 
 print("\nDone! Final dataset written to:", out_path)
 print("Total rows written:", total_rows_written)

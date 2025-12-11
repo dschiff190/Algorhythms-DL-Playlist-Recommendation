@@ -1,6 +1,8 @@
 """
-Training loop and step functions for the playlist recommendation model.
-Handles forward pass, loss computation, gradient updates, and checkpointing.
+Training Loop and Step Functions for Playlist Recommendation Model
+
+This module orchestrates the complete training process, including forward/backward passes,
+loss computation, metric calculation, and model checkpointing with history tracking.
 """
 import tensorflow as tf
 import tensorflow_hub as hub
@@ -8,28 +10,47 @@ import tqdm
 import sys
 import os
 import pickle
-from .losses import warp_loss, calculate_batch_metrics, calculate_hidden_r_precision
+from .losses_and_metrics import warp_loss, calculate_batch_metrics, calculate_hidden_r_precision
 
 
-#Pre-trained text embedding
 USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
 
 def encode_title(title_texts):
-    return USE(title_texts)   # shape (batch, 512)
+    """
+    Encode playlist titles using the Universal Sentence Encoder.
+    
+    Args:
+        title_texts (tf.Tensor or list): String texts to encode
+        
+    Returns:
+        tf.Tensor: Embeddings of shape (batch, 512)
+    """
+    return USE(title_texts)
 
-# Optimizer
+# Adam optimizer
 optimizer = tf.keras.optimizers.Adam(3e-4)
 
 @tf.function
 def train_step(model, batch_song_feats, batch_title_texts, batch_mask, batch_input_ids, labels, calculate_r_precision):
+    """
+    Execute a single training step including forward pass, loss computation, and gradient update.
+    
+    Args:
+        model (PlaylistModel): The model to train
+        batch_song_feats (tf.Tensor): Song features of shape (batch, seq_len, feature_dim)
+        batch_title_texts (tf.Tensor): Playlist titles for encoding
+        batch_mask (tf.Tensor): Attention mask of shape (batch, seq_len)
+        batch_input_ids (tf.Tensor): Masked track tokens as input
+        labels (tf.Tensor): Target track tokens for loss computation
+        calculate_r_precision (bool): Whether to compute R-Precision metric
+        
+    Returns:
+        tuple: (loss, r_precision, hidden_r_precision)
+    """
 
     with tf.GradientTape() as tape:
         title_emb = encode_title(batch_title_texts)
-
-        # PlaylistModel call method takes song_features, title_emb, mask
         logits = model(batch_song_feats, title_emb, batch_mask, training=True)
-
-        # The `labels` tensor (track tokens) is passed to `warp_loss` as `batch_playlist_ids`
         loss = warp_loss(logits, labels, batch_input_ids, num_neg_samples=50, margin=1.0)
 
         r_precision = tf.constant(-1.0, dtype=tf.float32) # Initialize as a tensor
@@ -206,8 +227,6 @@ def run_training(model, train_dataset, val_dataset, test_dataset, epochs=10, che
         history["train_r_prec_hidden"].append(avg_train_r_prec_hidden)
         history["val_r_prec_hidden"].append(avg_val_r_prec_hidden)
         
-        
-        
         print(f"Epoch {current_epoch} - Train Loss: {avg_train_loss:.4f} Train R-Prec: {avg_train_r_prec:4f} Train R-Prec (hidden): {avg_train_r_prec_hidden:4f} Val Loss: {avg_val_loss:.4f} Val R-Precision: {avg_val_r_prec:.4f} Val R-Precision: {avg_val_r_prec_hidden:.4f}")
         if avg_val_loss < best_val_loss:
             diff = best_val_loss - avg_val_loss
@@ -224,10 +243,3 @@ def run_training(model, train_dataset, val_dataset, test_dataset, epochs=10, che
             pickle.dump(history, f)
     
     return history, best_val_loss
-
-
-
-
-
-
-

@@ -1,3 +1,9 @@
+"""
+Inference and Prediction Module
+
+This module provides utilities for loading trained models, reconstructing data,
+and generating playlist recommendations using the trained SetTransformer model.
+"""
 import pandas as pd
 import tensorflow as tf
 import numpy as np
@@ -10,72 +16,51 @@ from src.model import PlaylistModel, build_song_encoder
 from src.train import encode_title
 
 
-# ====================================================
-# 2. DATA RECONSTRUCTION (The Heavy Part)
-# ====================================================
-
-print("⏳ Reading CSV (this may take a while)...")
+# Load data
+print("Reading CSV (this may take a while)...")
 start = time.perf_counter()
 playlists = pd.read_csv("playlist_song_features_FINAL_FULL.csv", nrows=10000, engine="pyarrow")
 print(f'read_csv took {start - time.perf_counter()}')
 
-# 2a. Fix NaNs (must match training)
+# Fix NaNs to match training preprocessing
 playlists["playlist_name"] = playlists["playlist_name"].fillna("").astype(str)
 
-# ====================================================
-# 2a.5 REBUILD FILLED COLUMNS (Required!)
-# Must match training preprocessing for *_filled columns
-# ====================================================
-
+# Rebuild filled columns
 for col in playlists.columns:
     if col.endswith("_filled"):
         base = col.replace("_filled", "")
         if base in playlists.columns:
-            # Fill using the exact same logic training used
             playlists[col] = playlists[base].fillna(0.0)
         else:
-            # If base column does not exist, leave it as-is
             playlists[col] = playlists[col].fillna(0.0)
 
-# ====================================================
-# 2b. LOAD TRAINING VOCAB (unchanged from original)
-# ====================================================
+# Reconstruct vocabulary
 print("⏳ Reconstructing Vocabulary...")
 K = 30000 
 UNK_TOKEN = '<UNK>' 
-UNK_ID = 0          
+UNK_ID = 0
 
 track_counts = playlists["track_id"].value_counts()
 top_k_track_ids = track_counts.head(K).index.tolist()
-
-# MUST match training order exactly
 vocab_list = [UNK_TOKEN] + sorted(top_k_track_ids)
 track2int = {tid: i for i, tid in enumerate(vocab_list)}
 int2track = {i: tid for tid, i in track2int.items()}
 
 VOCAB_SIZE = len(track2int)
-print(f"✅ Vocab Reconstructed. Size: {VOCAB_SIZE}")
+print(f"Vocab Reconstructed. Size: {VOCAB_SIZE}")
 
-# ====================================================
-# 2c. LOAD FEATURE COLS FROM TRAINING
-# ====================================================
+# Load feature columns
 print("⏳ Loading feature column list used during training...")
-
 import pickle
 with open("data/feature_cols.pkl", "rb") as f:
     feature_cols = pickle.load(f)
+print(f"Loaded {len(feature_cols)} feature columns (must match training exactly).")
 
-print(f"✅ Loaded {len(feature_cols)} feature columns (must match training exactly).")
-
-# ====================================================
-# 2d. REBUILD FEATURE MATRIX USING *THE SAME COLUMNS*
-# ====================================================
+# Reconstruct feature matrix
 print("⏳ Reconstructing Feature Dictionary with TRAINING columns...")
-
-# Ensure all required columns exist (sanity check)
 missing_cols = [c for c in feature_cols if c not in playlists.columns]
 if missing_cols:
-    raise ValueError(f"❌ Missing required feature columns: {missing_cols}")
+    raise ValueError(f"Missing required feature columns: {missing_cols}")
 
 # Select only the columns in the exact original order
 track_features_df = (
@@ -90,23 +75,17 @@ track2feat = {
 }
 
 FEATURE_DIM = len(feature_cols)
-print(f"✅ Features Loaded. FEATURE_DIM = {FEATURE_DIM}")
+print(f"Features Loaded. FEATURE_DIM = {FEATURE_DIM}")
 
-# ====================================================
-# 2e. Metadata lookup
-# ====================================================
+# Load metadata lookup
 meta_df = playlists.drop_duplicates(subset=['track_id']).set_index('track_id')[['track_name', 'artist_name']]
 track_meta = {
     tid: f"{row['track_name']} by {row['artist_name']}"
     for tid, row in meta_df.iterrows()
 }
+print("Metadata reconstructed.")
 
-print("✅ Metadata reconstructed.")
-
-# ====================================================
-# 3. LOAD MODEL
-# ====================================================
-
+# Initialize model
 print("⏳ Loading Universal Sentence Encoder...")
 USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
 
@@ -121,34 +100,31 @@ model = PlaylistModel(
     emb_dim=EMB_DIM
 )
 
-# Dummy call to build graph
+# Build the model graph with a dummy call
 dummy_feat = tf.zeros((1, 5, FEATURE_DIM))
 dummy_title = encode_title(["dummy"])
 dummy_mask = tf.ones((1, 5))
 _ = model(dummy_feat, dummy_title, dummy_mask)
 
-# Load Checkpoint
+# Load checkpoint
 print("⏳ Restoring Weights...")
 checkpoint_dir = "./playlist_model_ckpts"
 checkpoint = tf.train.Checkpoint(optimizer=tf.keras.optimizers.Adam(3e-4), model=model)
 latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
 
 if latest_checkpoint:
-    # Expect partial because we don't care about optimizer state for inference
     status = checkpoint.restore(latest_checkpoint).expect_partial()
-    print(f"✅ Model weights restored from {latest_checkpoint}")
+    print(f"Model weights restored from {latest_checkpoint}")
 else:
     print("❌ No checkpoint found. Check your directory path.")
 
-# ====================================================
-# 4. INFERENCE LOGIC
-# ====================================================
+# Inference functions
 
 def build_manual_batch(track_ids, track2feat, unk_id=0):
     valid_ids = [tid for tid in track_ids if (tid in track2int) and (tid in track2feat)]
     
     if not valid_ids:
-        print("🚨 Error: None of the provided track IDs were found in the training vocabulary.")
+        print("Error: None of the provided track IDs were found in the training vocabulary.")
         return None, None, None, None
 
     token_ids = [track2int.get(tid, unk_id) for tid in valid_ids]
@@ -171,14 +147,14 @@ def autoregressive_recommend(
     playlist_song_ids,
     k=3,
     num_generated=5,
-    exclude_original=True  # NEW
+    exclude_original=True  
 ):
     sf = tf.identity(song_features)
     m   = tf.identity(mask)
     ids = tf.identity(playlist_song_ids)
 
     # Keep a separate handle on the original playlist length
-    orig_len = playlist_song_ids.shape[0]  # Python int in eager mode
+    orig_len = playlist_song_ids.shape[0]  
 
     generated_ids = []
     
@@ -188,21 +164,16 @@ def autoregressive_recommend(
         title_emb = encode_title([title_text])
         logits = model(sf, title_emb, m, training=False)[0]
 
-        # -------------------------
-        # Build the "seen" set
-        # -------------------------
+
+        # Determine which songs to exclude from recommendations
         if exclude_original:
-            # Current behavior: block original + generated
+            # Block both original and generated songs
             seen = ids[ids >= 0]
         else:
-            # New behavior: allow original playlist songs,
-            # only block songs we have generated in this loop.
-            # First `orig_len` entries of `ids` are the original playlist;
-            # entries after that are generated tokens.
-            seen = ids[orig_len:]  # slice off the original songs
+            # Allow original songs, only block newly generated ones
+            seen = ids[orig_len:]
 
-        # If there is nothing to exclude yet (first step and allow-original mode),
-        # just use logits as-is.
+        # Apply exclusion mask to logits
         if tf.size(seen) > 0:
             exclude_mask = tf.scatter_nd(
                 tf.expand_dims(seen, 1),
@@ -237,26 +208,21 @@ def autoregressive_recommend(
 
     return generated_ids
 
-# ====================================================
-# 5. MANUAL "HUMAN TEST" PLAYLISTS
-#     Each run with:
-#       - ALLOW originals
-#       - EXCLUDE originals
-# ====================================================
-
-tracks_df = playlists  # alias for readability
+# Test playlists
+tracks_df = playlists
 
 def pretty_print_playlist(playlist_song_ids, title_label):
-    print("\n======================================")
-    print("=== MANUAL HUMAN TEST PLAYLIST ===")
-    print("Title:", title_label)
+    print("\n" + "="*40)
+    print(f"Playlist: {title_label}")
+    print("="*40)
 
     original_token_ids = playlist_song_ids.numpy().tolist()
     original_track_ids = [int2track[int(tok)] for tok in original_token_ids]
 
     print("\nSongs already in playlist:")
 
-    seen = set()  # optional: avoid printing duplicates if the seed list itself repeats
+    # optional: avoid printing duplicates if the seed list itself repeats
+    seen = set()  
     for tid in original_track_ids:
         if tid in seen:
             continue
@@ -281,13 +247,10 @@ def run_human_test(track_ids, title_text):
         return
 
     pretty_print_playlist(playlist_song_ids, title_text)
-
-    # ===== ORIGINAL TOKEN IDS (as integers) =====
     original_token_ids = set(playlist_song_ids.numpy().tolist())
 
-    # ----------------------------------------------------
-    # MODE A: ALLOW ORIGINALS
-    # ----------------------------------------------------
+   
+    # Mode 1: allow originals to be seen 
     print("\n-- Initial Recommendations (ALLOW originals) --")
     rec_ids_allow = autoregressive_recommend(
         model=model,
@@ -304,9 +267,7 @@ def run_human_test(track_ids, title_text):
         tid = int2track.get(int(rid), "UNKNOWN")
         print(" ➜", track_meta.get(tid, tid))
 
-    # ----------------------------------------------------
-    # FILTER OUT REPEATS
-    # ----------------------------------------------------
+    # Filter out repeats
     unique_recs = [rid for rid in rec_ids_allow if rid not in original_token_ids]
     num_unique = len(unique_recs)
     num_missing = 10 - num_unique
@@ -317,9 +278,7 @@ def run_human_test(track_ids, title_text):
     else:
         print(f"\nFound {10 - num_unique} repeat(s). Generating {num_missing} replacement(s)...")
 
-        # ----------------------------------------------------
-        # MODE B: EXCLUDE ORIGINALS (generate only missing ones)
-        # ----------------------------------------------------
+        # Mode 2: exclude originals in playlist
         extra_recs = autoregressive_recommend(
             model=model,
             song_features=song_feats,
@@ -336,12 +295,15 @@ def run_human_test(track_ids, title_text):
     # Safety: ensure final list has exactly 10
     final_recs = final_recs[:10]
 
-    print("\n====== FINAL 10 NON-REPEATED RECOMMENDATIONS ======")
+    print("\n" + "="*40)
+    print("FINAL 10 RECOMMENDATIONS")
+    print("="*40)
     for rid in final_recs:
         tid = int2track.get(int(rid), "UNKNOWN")
         print(" ➜", track_meta.get(tid, tid))
 
 # ====== Pop PLAYLIST ======
+
 pop_ids = [
     "5Q0Nhxo0l2bP3pNjpGJwV1",
     "1Slwb6dOYkBlWal1PGtnNg",
@@ -444,11 +406,10 @@ rap_ids = [
     "5qxChyzKLEyoPJ5qGrdurN",
     "5uZm7EFtP5aoTJvx5gv9Xf",
     "5uQOauh47VFt3B2kV9kRXw",
+
 ]
 
 run_human_test(rap_ids, "Rap")
-
-
 
 # ====== Country PLAYLIST ======
 country_ids = [

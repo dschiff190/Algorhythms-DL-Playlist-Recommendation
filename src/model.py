@@ -1,28 +1,28 @@
-
-"""# Model Architecture
-
-THINGS TO THINK ABOUT:
-*   Vocab size?
-*   Embedding dim?
-*   K number of seed vectors?
-*   Better loss function!!!!!
 """
+Model Architecture for Playlist Recommendation System
 
+This module defines the deep learning models used for playlist recommendation,
+including attention mechanisms (PMA, SAB), the SetTransformer for sequence modeling,
+and the complete PlaylistModel that combines song features with playlist context.
+"""
 import tensorflow as tf
 import tensorflow_hub as hub
 
 
-"""## Pooling by multi-headed attention
-This is so that once we have all the context-enriched embeddings of the songs in the playlist, we can learn how to make a final (pooled) representation of the playlist that we can give to our output projection layer.
-"""
-
 class PMA(tf.keras.layers.Layer):
     """
     Pooling by Multihead Attention (Lee et al. 2019)
-    k seeds -> output shape (batch, k, dim)
-    For playlist classification: we use k=1
+    
+    Learns a set of seed vectors that attend to all items in a sequence,
+    producing a fixed-size representation regardless of input sequence length.
+    For playlist classification, k=1 produces a single vector per playlist.
+    
+    Args:
+        dim (int): Dimension of the attention space
+        num_heads (int): Number of attention heads
+        k (int): Number of seed vectors to learn (default: 1)
+        dropout (float): Dropout rate for regularization (default: 0.1)
     """
-    #DOING K=1 FOR NOW - MAY EXPERIMENT WITH K > 1
     def __init__(self, dim, num_heads, k=1, dropout=0.1):
         super().__init__()
         self.k = k
@@ -44,8 +44,15 @@ class PMA(tf.keras.layers.Layer):
 
     def call(self, x, mask, training=False):
         """
-        x:      (batch, seq_len, dim)
-        mask:   (batch, seq_len)
+        Forward pass for PMA layer.
+        
+        Args:
+            x (tf.Tensor): Input tensor of shape (batch, seq_len, dim)
+            mask (tf.Tensor): Attention mask of shape (batch, seq_len)
+            training (bool): Whether in training mode
+            
+        Returns:
+            tf.Tensor: Pooled output of shape (batch, dim) when k=1
         """
         batch_size = tf.shape(x)[0]
 
@@ -56,10 +63,10 @@ class PMA(tf.keras.layers.Layer):
             axis=0
         )
 
-        # Convert mask to attention mask (batch, k, seq_len)
+        # Prepare attention mask
         attn_mask = tf.expand_dims(mask, axis=1)
 
-        # Attention: seeds attend to all playlist items
+        # Apply attention
         h = self.mha(
             #query is the seed vectors
             query=seeds,
@@ -70,18 +77,25 @@ class PMA(tf.keras.layers.Layer):
             training=training
         )
 
-        #residual connection
+        # Add residual connection and normalize
         h = seeds + self.dropout(h, training=training)
         h = self.norm(h)
 
-        # If k=1, return shape (batch, dim)
-        return h[:, 0, :]     # pick the single pooled vector
+        return h[:, 0, :]     
 
-"""## Attention block
-For learning relationships between songs in the playlist
-"""
 
 class SAB(tf.keras.layers.Layer):
+    """
+    Set Attention Block (Lee et al. 2019)
+    
+    Applies multi-head self-attention followed by a feed-forward network
+    to learn relationships between songs in a playlist.
+    
+    Args:
+        dim (int): Dimension of the attention space
+        num_heads (int): Number of attention heads
+        dropout (float): Dropout rate for regularization (default: 0.1)
+    """
     def __init__(self, dim, num_heads, dropout=0.1):
         super().__init__()
         self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -99,6 +113,17 @@ class SAB(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout)
 
     def call(self, x, mask, training=False):
+        """
+        Forward pass for SAB layer.
+        
+        Args:
+            x (tf.Tensor): Input tensor of shape (batch, seq_len, dim)
+            mask (tf.Tensor): Attention mask of shape (batch, seq_len)
+            training (bool): Whether in training mode
+            
+        Returns:
+            tf.Tensor: Output tensor of shape (batch, seq_len, dim)
+        """
         attn_mask = tf.expand_dims(mask, axis=1)
 
         h = self.norm1(x)
@@ -127,6 +152,17 @@ class SetTransformer(tf.keras.Model):
         self.pma = PMA(playlist_representation_sz, num_heads, k=1, dropout=dropout)
 
     def call(self, x, mask, training=False):
+        """
+        Forward pass for SetTransformer.
+        
+        Args:
+            x (tf.Tensor): Input tensor of shape (batch, seq_len, dim)
+            mask (tf.Tensor): Attention mask of shape (batch, seq_len)
+            training (bool): Whether in training mode
+            
+        Returns:
+            tf.Tensor: Pooled playlist representation of shape (batch, playlist_representation_sz)
+        """
         for sab in self.sabs:
             x = sab(x, mask, training=training)
             
@@ -156,27 +192,26 @@ class PlaylistModel(tf.keras.Model):
             dropout=dropout,
             playlist_representation_sz=playlist_representation_sz
         )
-        # NEW: Layer to project the title embedding (512-dim from USE) down to emb_dim (128-dim)
+
+        # Layer to project the title embedding (512-dim from USE) down to emb_dim (128-dim)
         self.title_projector = tf.keras.layers.Dense(emb_dim)
 
+        # Final dense layer 
         self.final_dense = tf.keras.layers.Dense(num_songs)
 
     def call(self, song_features, title_emb, mask, training=False):
 
-        # 1. Encode Song Features
+        # Encode Song Features
         song_emb = self.song_encoder(song_features) # (batch, seq, emb_dim=128)
 
-        # 2. Project Title Embedding to match song_emb dimension
+        # Project Title Embedding to match song_emb dimension
         projected_title_emb = self.title_projector(title_emb) # (batch, emb_dim=128)
 
-        # 3. Prepare for Concatenation
+        # Concatenate (Axis 2 dimensions now match: 128)
         title_token = tf.expand_dims(projected_title_emb, axis=1) # (batch, 1, emb_dim=128)
-
-        # 4. Concatenate (Axis 2 dimensions now match: 128)
         x = tf.concat([title_token, song_emb], axis=1)
 
-        # ... rest of the function (mask concatenation, set_transformer call) ...
-        # Check this out mayhaps
+        # Rest of the function (mask concatenation, set_transformer call)
         title_mask = tf.ones((mask.shape[0], 1), dtype=mask.dtype)
         full_mask = tf.concat([title_mask, mask], axis=1)
         pooled = self.set_transformer(x, full_mask, training=training)

@@ -4,7 +4,7 @@ Exposes main classes and utilities for training and inference.
 """
 
 from .model import PMA, SAB, SetTransformer, build_song_encoder, PlaylistModel
-from .losses import sample_negative, warp_loss, calculate_batch_metrics, calculate_hidden_r_precision
+from .losses_and_metrics import sample_negative, warp_loss, calculate_batch_metrics, calculate_hidden_r_precision
 from .preprocessing import (
     serialize_playlist,
     parse_playlist,

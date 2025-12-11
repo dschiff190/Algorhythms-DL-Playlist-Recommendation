@@ -1,5 +1,8 @@
 """
-Data loading orchestration - wraps all preprocessing logic.
+Data Loading Utilities for Playlist Recommendation
+
+This module provides functions to load and prepare TFRecord datasets for training,
+including dataset creation, parsing, batching, and augmentation with masking.
 """
 import os
 import time
@@ -20,13 +23,17 @@ from .preprocessing import (
 def load_and_prepare_data(csv_path):
     """
     Complete data loading and preparation pipeline.
-    Contains all preprocessing logic from the original notebook.
     
+    Orchestrates the entire data loading workflow including CSV reading, track
+    vocabulary creation, train/val/test splitting, and TFRecord serialization.
+    
+    Args:
+        csv_path (str): Path to CSV file containing playlist data
+        
     Returns:
-        tuple: (train_dataset, val_dataset, test_dataset, vocab_info)
+        tuple: (train_dataset, val_dataset, test_dataset, vocab_info) where vocab_info
+               contains VOCAB_SIZE and mapping dictionaries
     """
-
-    # CHANGE PATH FOR OSCAR
     print("reading csv...")
     start = time.perf_counter()
     playlists = pd.read_csv(csv_path, nrows=10000)
@@ -57,14 +64,12 @@ def load_and_prepare_data(csv_path):
 
     # Add all the genre columns, which start from 'genre_acoustic'
     genre_columns = [col for col in playlists.columns if col.startswith('genre_')]
-
     all_track_features = track_columns + genre_columns
 
-    # 2. Create a new DataFrame containing only track information
+    # Create a new DataFrame containing only track information
     tracks_df = playlists[all_track_features].copy()
 
-    # 3. Drop duplicates to ensure each track ID appears only once
-    # (A single track might be in multiple playlists)
+    # Drop duplicates to ensure each track ID appears only once
     tracks_df.drop_duplicates(subset=['track_id'], inplace=True)
 
     print(f"\nTotal unique tracks extracted: {len(tracks_df)}")
@@ -72,60 +77,51 @@ def load_and_prepare_data(csv_path):
 
     """The code block below is to pull the information from the dataset"""
 
-    # 1. Create a sorted list of all unique track IDs present in the dataset
+    # Create a sorted list of all unique track IDs present in the dataset
     unique_ids = sorted(playlists["track_id"].unique().tolist())
-    K = 30000 # Number of most frequent songs to keep as part of the vocabulary
-    UNK_TOKEN = '<UNK>' # Special token for unknown tracks
-    UNK_ID = 0          # Reserve the 0 index for the UNK token
-    # 2. Create the Vocabulary Mappings (Track ID <-> Integer Index)
-    # Map each unique track ID to a unique integer index (token)
 
-    # 1. Calculate the frequency of each track ID
-    # The 'playlists' DataFrame contains all tracks across all playlists.
+    # Most frequent songs to keep as part of vocab
+    K = 30000 
+
+    # Special token for unknown tracks
+    UNK_TOKEN = '<UNK>' 
+
+    # Reserve the 0 index for the UNK token
+    UNK_ID = 0          
+
+    # Calculate the frequency of each track ID
     track_counts = playlists["track_id"].value_counts()
     print(f"Total unique tracks found: {len(track_counts)}")
 
-    # 2. Select the Top-K most frequent track IDs
+    # Select the Top-K most frequent track IDs
     top_k_track_ids = track_counts.head(K).index.tolist()
     print(f"Top {K} tracks selected for vocabulary.")
 
-    # 3. Create the Vocabulary Mappings (Track ID <-> Integer Index)
-
-    # The list of tracks that will have a dedicated token:
-    # Top-K tracks + the UNK_TOKEN itself (which gets the first index, UNK_ID=0)
-    # This list is used to determine the order of the remaining token indices.
+    # Create vocabulary mappings
     vocab_list = [UNK_TOKEN] + sorted(top_k_track_ids)
     track2int = {tid: i for i, tid in enumerate(vocab_list)}
     # Map each integer index back to the track ID
     int2track = {i: tid for tid, i in track2int.items()}
 
-    # 3. Define the Vocabulary Size
+    # Define vocab size 
     VOCAB_SIZE = K
     print(f"Total Unique Tracks (VOCAB_SIZE): {VOCAB_SIZE}")
 
-    # 4. Map the track IDs in the DataFrame to their new integer tokens
+    # Map track IDs to integer tokens
     playlists["track_token"] = playlists["track_id"].apply(
         lambda tid: track2int.get(tid, UNK_ID)
     )
-    # TO DO:
-    # change the playlists and get rid of ones that have less than 5 songs that are not unk
+
+    # Filter out playlists with too few valid songs (< 5 songs)
     MIN_NON_UNK_SONGS = 5
-
     is_not_unk = playlists["track_token"] != UNK_ID
-    # Group by playlist_id and sum the boolean Series (True=1, False=0)
-    # This gives the count of non-UNK songs for each playlist.
     non_unk_counts = is_not_unk.groupby(playlists["playlist_id"]).sum()
-
-    # 2. Identify the playlist IDs that meet the minimum song requirement (>= 5)
     valid_playlist_ids = non_unk_counts[non_unk_counts >= MIN_NON_UNK_SONGS].index
 
-    # 3. Filter the original playlists DataFrame
+    # Filter playlists
     initial_track_count = len(playlists)
     initial_playlist_count = playlists["playlist_id"].nunique()
-
-    # Filter the playlists DataFrame to only include tracks from the valid playlists
     playlists = playlists[playlists["playlist_id"].isin(valid_playlist_ids)].copy()
-
     final_track_count = len(playlists)
     final_playlist_count = playlists["playlist_id"].nunique()
 
@@ -133,8 +129,6 @@ def load_and_prepare_data(csv_path):
     print(f"Playlists before filtering: {initial_playlist_count} (Total Tracks: {initial_track_count})")
     print(f"Playlists retained (with >= {MIN_NON_UNK_SONGS} non-UNK songs): {final_playlist_count} (Total Tracks: {final_track_count})")
 
-
-    # 5. Define and Extract Feature Columns
     # List of the standard audio feature columns
     feature_cols = [
         "danceability","energy","key","loudness","mode", "year_filled","popularity_filled","explicit_filled", "year_is_missing","popularity_is_missing", "explicit_is_missing", # ------------- removed popularity -------------------
@@ -158,33 +152,33 @@ def load_and_prepare_data(csv_path):
     }
 
     """This next block is to group the playlists by id"""
+
     # Group 1: Features
     grouped_features = (
         playlists.groupby("playlist_id")
-        .apply(lambda df: df[feature_cols].values, include_groups=False) # ADDED ARGUMENT
+        .apply(lambda df: df[feature_cols].values, include_groups=False) 
     )
 
     # Group 2: Track Tokens
     grouped_track_tokens = (
         playlists.groupby("playlist_id")
-        .apply(lambda df: df["track_token"].values, include_groups=False) # ADDED ARGUMENT
+        .apply(lambda df: df["track_token"].values, include_groups=False)
     )
 
     # Group 3: Playlist Titles
     grouped_titles = (
         playlists.groupby("playlist_id")
-        .apply(lambda df: df["playlist_name"].iloc[0], include_groups=False) # ADDED ARGUMENT
+        .apply(lambda df: df["playlist_name"].iloc[0], include_groups=False) 
     )
 
     """This next block changes the data into smaller segments"""
 
     
-
     tfrecord_path = "playlists.tfrecord"
 
     all_playlist_ids = grouped_features.index.tolist()
 
-    # First split: 80% Train, 20% Temp (Test + Val)
+    # Split: 80% Train, 20% Temp (Test + Val)
     train_ids, temp_ids = train_test_split(all_playlist_ids, test_size=0.2, random_state=42)
 
     # Second split: Split the 20% Temp into 50/50 Validation and Test (10% total each)
@@ -222,16 +216,7 @@ def load_and_prepare_data(csv_path):
     test_dataset  = prepare_batched_dataset(test_dataset, FEATURE_DIM)
     print("Datasets prepared successfully (Order Preserved)!")
 
-
-    # ==========================================
-    # APPLY TO DATASETS
-    # ==========================================
-
-    # Apply the denoising map function
-    # Note: We use the same logic for Train/Val/Test so we can measure reconstruction capability
-    # However, usually for Test you might want a deterministic mask (e.g. hide last 20%)
-    # or just run standard next-item prediction. For now, random dropout is fine for validation.
-
+    # Apply the denoising map function to measure reconstruction capability
     train_dataset_final = train_dataset.map(create_input_target_with_dropout, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = train_dataset_final.prefetch(tf.data.AUTOTUNE)
 

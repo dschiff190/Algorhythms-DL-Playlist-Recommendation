@@ -1,88 +1,95 @@
 """
-Loss functions and metrics for the playlist recommendation model.
-Includes: WARP loss, negative sampling, and R-Precision metrics.
+Loss Functions and Evaluation Metrics for Playlist Recommendation
+
+This module implements the WARP (Weighted Approximate-Rank Pairwise) loss function
+for training and R-Precision metrics for evaluating playlist recommendation performance.
 """
 import tensorflow as tf
 import numpy as np
 
-"""## Loss Functions"""
-
 # Hyperparameters for the Hybrid Loss
-SEEN_WEIGHT = 0.5   # Lower weight for reconstruction (Autoencoder task)
-HIDDEN_WEIGHT = 1.0 # Higher weight for prediction (Recommender task)
+
+# Lower weight for reconstruction (Autoencoder task)
+SEEN_WEIGHT = 0.5   
+
+# Higher weight for prediction (Recommender task)
+HIDDEN_WEIGHT = 1.0 
 
 def sample_negative(batch_playlist_ids, num_songs, num_neg_samples):
     """
-    batch_playlist_ids: (batch, seq_len) int32, padded with -1
-    num_songs: int
-    num_neg_samples: int
-
-    Returns: (batch, num_neg_samples)
+    Sample negative examples for WARP loss computation.
+    
+    Randomly selects songs that are NOT in the playlist to serve as negative samples.
+    Sampling is done per playlist, ensuring no negative samples are songs already
+    in the target playlist.
+    
+    Args:
+        batch_playlist_ids (tf.Tensor): Target song IDs of shape (batch, seq_len), padded with -1
+        num_songs (int): Total vocabulary size
+        num_neg_samples (int): Number of negative samples to draw per playlist
+        
+    Returns:
+        tf.Tensor: Negative sample indices of shape (batch, num_neg_samples)
     """
 
     batch_size = tf.shape(batch_playlist_ids)[0]
 
-    # Build range of all song IDs
-    all_ids = tf.range(num_songs, dtype=tf.int64)  # Changed dtype to tf.int64
+    # Build range of all song IDs -> (1, 1, num_songs))
+    all_ids = tf.range(num_songs, dtype=tf.int64) 
 
-    # 1) Build a mask of which songs are present in each playlist
-    # playlist_mask[b, id] = True if id is in playlist b
-    # -------------------------------------------------------------
-    # Expand dims to broadcast:
-    # batch_playlist_ids       -> (batch, seq_len, 1)
-    # all_ids                  -> (1, 1, num_songs)
+    # batch_playlist_ids -> (batch, seq_len, 1)
     equal_matrix = tf.equal(
         tf.expand_dims(batch_playlist_ids, axis=2),
         tf.reshape(all_ids, (1, 1, num_songs))
-    )   # (batch, seq_len, num_songs)
+    )   
 
-    # Ignore padded IDs (-1)
+    # Exclude padding from the mask
     valid_mask = tf.expand_dims(batch_playlist_ids >= 0, axis=2)
     equal_matrix = equal_matrix & valid_mask
 
-    # Now collapse seq_len to get a final (batch, num_songs) mask
-    playlist_contains = tf.reduce_any(equal_matrix, axis=1)   # (batch, num_songs)
+    # Collapse to (batch, num_songs)
+    playlist_contains = tf.reduce_any(equal_matrix, axis=1)
+    allowed_mask = ~playlist_contains
 
-    # 2) Allowed songs mask = NOT in playlist
-    allowed_mask = ~playlist_contains   # (batch, num_songs)
-
-    # 3) We now need to sample num_neg_samples per batch row.
-    # For this, generate random scores for each song and pick top-k among allowed songs.
-    # -------------------------------------------------------------
+    # Sample negatives by choosing top-k unallowed songs by random score
     random_scores = tf.random.uniform((batch_size, num_songs))
 
     # Set disallowed items to -inf so they are never chosen
     neg_inf = tf.constant(-1e9, dtype=random_scores.dtype)
     masked_scores = tf.where(allowed_mask, random_scores, neg_inf)
 
-    # 4) For each batch row, take the top-k items as negatives.
-    # top_k.values ignored; we care about indices
+    # For each batch row, take the top-k items as negatives.
     _, neg_indices = tf.math.top_k(masked_scores, k=num_neg_samples)
-
-    # Shape (batch, num_neg_samples)
     return neg_indices
 
 def warp_loss(logits, batch_playlist_ids, input_ids, num_neg_samples=50, margin=1.0):
     """
     WARP loss that automatically weights samples based on Input vs Target.
 
-    logits: (Batch, Vocab)
-    batch_playlist_ids: (Batch, Seq_Len) - The Target (Full Playlist)
-    input_ids: (Batch, Seq_Len) - The Input (Masked Playlist)
+    Computes Weighted Approximate-Rank Pairwise loss that weights samples based
+    on whether they were visible (SEEN) or hidden (HIDDEN) in the input.
+    
+    Args:
+        logits (tf.Tensor): Model predictions of shape (batch, vocab_size)
+        batch_playlist_ids (tf.Tensor): Target full playlist of shape (batch, seq_len), padded with -1
+        input_ids (tf.Tensor): Input playlist with masking of shape (batch, seq_len), padded with -1
+        num_neg_samples (int): Number of negative samples per positive (default: 50)
+        margin (float): Margin for WARP ranking violation (default: 1.0)
+        
+    Returns:
+        tf.Tensor: Scalar loss value
     """
     batch_size = tf.shape(logits)[0]
     num_songs = tf.shape(logits)[1]
 
-    # 1. Identify Valid Targets (Ignore Padding)
-    # Assumes padding is -1. Change to > 0 if using 0 as padding.
+    # Identify valid targets (skip padding)
     valid_mask = batch_playlist_ids >= 0
 
-    # 2. Calculate Sample Weights internally
-    # Case A: Input matches Target => It was SEEN (Autoencoder task)
+    # Weight samples by visibility: seen items get lower weight (reconstruction),
+    # hidden items get higher weight (recommendation task)
     is_seen = tf.equal(batch_playlist_ids, input_ids)
 
-    # Case B: Input does NOT match Target => It was HIDDEN (Recommender task)
-    # (Since we masked it with 0 in the input)
+    #  Input does NOT match Target => It was HIDDEN (Recommender task); Mask with 0 in input
     is_hidden = tf.not_equal(batch_playlist_ids, input_ids)
 
     # Create weight tensor
@@ -90,8 +97,7 @@ def warp_loss(logits, batch_playlist_ids, input_ids, num_neg_samples=50, margin=
     sample_weights = tf.where(is_seen, SEEN_WEIGHT, sample_weights)
     sample_weights = tf.where(is_hidden, HIDDEN_WEIGHT, sample_weights)
 
-    # 3. Apply Masking (Remove Padding) to Logits and Weights
-    # Get values only for valid songs
+    # Apply Masking (Remove Padding) to Logits and Weights (get values only for valid songs)
     safe_ids = tf.where(valid_mask, batch_playlist_ids, tf.zeros_like(batch_playlist_ids))
     gathered_logits = tf.gather(logits, safe_ids, axis=1, batch_dims=1)
 
@@ -104,10 +110,10 @@ def warp_loss(logits, batch_playlist_ids, input_ids, num_neg_samples=50, margin=
     weights_dense = weights_ragged.to_tensor(default_value=0.0)
     pos_lengths = pos_scores_ragged.row_lengths()
 
-    # 4. Sample Negatives
+    # Sample Negatives
     neg_samples = sample_negative(batch_playlist_ids, num_songs, num_neg_samples)
 
-    # 5. Compute Loss per Playlist
+    # Compute Loss per Playlist
     def _compute_single_playlist_loss(args):
         scores_i, weights_i, len_i, neg_idxs_i, logits_i = args
 
@@ -118,10 +124,8 @@ def warp_loss(logits, batch_playlist_ids, input_ids, num_neg_samples=50, margin=
         def single_item_loss(pair):
             pos_score, weight = pair
 
-            # Get negative scores for this playlist
+            # Get negative scores for this playlist & check for WARP violations
             neg_scores = tf.gather(logits_i, neg_idxs_i)
-
-            # Check for WARP violations
             violations = neg_scores > (pos_score - margin)
             violation_indices = tf.where(violations)
 
@@ -148,6 +152,7 @@ def warp_loss(logits, batch_playlist_ids, input_ids, num_neg_samples=50, margin=
 
         total_weight = tf.maximum(tf.reduce_sum(real_weights),1)
         return total_loss/ total_weight
+    
     # Map over batch
     batch_losses = tf.map_fn(
         _compute_single_playlist_loss,
@@ -164,7 +169,8 @@ def warp_loss(logits, batch_playlist_ids, input_ids, num_neg_samples=50, margin=
 
 def calculate_batch_metrics(logits, target_ids_padded):
     """
-    Calculates evaluation metrics for a batch of playlist predictions.
+
+    Calculates r-precision - the proportion of relevant tracks in top R recommendations
 
     Args:
         logits: (batch_size, vocab_size) - Raw score predictions from the model.
@@ -173,6 +179,7 @@ def calculate_batch_metrics(logits, target_ids_padded):
     Returns:
         dict: containing 'r_precision'
     """
+
     # Ensure inputs are numpy arrays
     if hasattr(logits, 'numpy'):
         logits = logits.numpy()
@@ -184,7 +191,7 @@ def calculate_batch_metrics(logits, target_ids_padded):
     r_precisions = []
 
     for i in range(batch_size):
-        # 1. Extract valid Ground Truth IDs (Remove padding -1)
+        # Extract valid Ground Truth IDs (Remove padding -1)
         true_ids = target_ids_padded[i]
         true_ids = true_ids[true_ids >= 0]
 
@@ -194,25 +201,18 @@ def calculate_batch_metrics(logits, target_ids_padded):
 
         R = len(true_ids)
 
-        # --- Metric: R-Precision ---
-        # "Proportion of relevant tracks in top R recommendations"
-        # We need the indices of the top R highest scores in logits
-
-        # Optimization: Use argpartition to find top R without full sort
+        # Retrieve the indices of the top R highest scores in logits
         # (Negative R because we want the largest values)
         if R >= logits.shape[1]:
             top_r_indices = np.arange(logits.shape[1])
         else:
-            # Indices of the top R scores
             top_r_indices = np.argpartition(logits[i], -R)[-R:]
-
-        # Intersection between Truth and Predictions
         relevant_matches = np.intersect1d(true_ids, top_r_indices)
 
         # R-Precision = (Intersection Count) / R
         r_precisions.append(len(relevant_matches) / R)
 
-    # 2. Aggregate Batch Results
+    # Aggregate Batch Results
     avg_r_precision = np.mean(r_precisions) if r_precisions else 0.0
 
     return avg_r_precision
@@ -237,9 +237,7 @@ def calculate_hidden_r_precision(logits, target_ids, input_ids):
     r_precisions = []
 
     for i in range(batch_size):
-        # 1. Identify Hidden Songs
-        # A song is hidden if the Target does not equal Input AND Target is not padding (-1)
-        # Note: In your masking logic, masked tokens became 0.
+        # Identify Hidden Songs (if target != input & input is not padded)
         original = target_ids[i]
         masked = input_ids[i]
 
@@ -248,13 +246,11 @@ def calculate_hidden_r_precision(logits, target_ids, input_ids):
         original = original[valid_indices]
         masked = masked[valid_indices]
 
-        # Identify which specific IDs were hidden
-        # (Where original != masked)
+        # Identify which specific IDs were hidden (Where original != masked)
         hidden_mask = (original != masked)
         hidden_ids = original[hidden_mask]
         
         # Identify which specific IDs were SEEN (kept)
-        # We want to prevent the model from just predicting what it already sees
         seen_ids = masked[masked > 0] # indices that are not UNK/0
 
         R = len(hidden_ids)
@@ -263,26 +259,19 @@ def calculate_hidden_r_precision(logits, target_ids, input_ids):
         if R == 0:
             continue
 
-        # 2. Modify Logits to ignore SEEN songs
-        # We want to see if the model predicts the MISSING songs, not the visible ones.
-        # Create a copy so we don't affect gradients or other calcs
+        # Modify Logits to ignore SEEN songs (create copy to not impact gradients)
         row_logits = logits[i].copy()
         
         # Set seen songs to -infinity so they are never picked in Top-R
-        # (This makes the metric stricter and more accurate for recommendation)
         row_logits[seen_ids] = -float('inf')
 
-        # 3. Get Top R Predictions
-        # Use argpartition for efficiency (O(n)) vs argsort (O(n log n))
+        # Get Top R Predictions
         if R >= row_logits.shape[0]:
             top_r_indices = np.arange(row_logits.shape[0])
         else:
-            # We want indices of the largest R values
             top_r_indices = np.argpartition(row_logits, -R)[-R:]
 
-        # 4. Calculate Intersection
         relevant_matches = np.intersect1d(hidden_ids, top_r_indices)
-        
         r_precisions.append(len(relevant_matches) / R)
 
     if not r_precisions:
