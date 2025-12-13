@@ -1,37 +1,175 @@
+"""
+Inference and Prediction Module
+
+This module provides utilities for loading trained models, reconstructing data,
+and generating playlist recommendations using the trained SetTransformer model.
+On first run, it computes and caches vocabularies and features as pickle files.
+On subsequent runs, it loads from cache for efficiency.
+"""
 import pandas as pd
 import tensorflow as tf
-import numpy as np
 import tensorflow_hub as hub
+import numpy as np
 import os
-import datetime
-import time
 import pickle
-import random
+import time
 
 from src.model import PlaylistModel, build_song_encoder
 from src.train import encode_title
 
-# ====================================================
-# 2. Reconstruct data
-# ====================================================
 
-UNK_TOKEN = '<UNK>' 
-UNK_ID = 0  
+# 1. CONFIGURATION
+CSV_PATH = "playlist_song_features_FINAL_FULL.csv"
+PICKLE_DIR = "./"
+VOCAB_SIZE_K = 30000
+UNK_TOKEN = '<UNK>'
+UNK_ID = 0
 
-with open("track2int.pkl", "rb") as f:
-    track2int = pickle.load(f)
+# Pickle file paths
+PICKLE_FILES = {
+    'track2int': os.path.join(PICKLE_DIR, "track2int.pkl"),
+    'int2track': os.path.join(PICKLE_DIR, "int2track.pkl"),
+    'feature_cols': os.path.join(PICKLE_DIR, "feature_cols.pkl"),
+    'track2feat': os.path.join(PICKLE_DIR, "track2feat.pkl"),
+    'track_meta': os.path.join(PICKLE_DIR, "track_meta.pkl"),
+}
 
-with open("int2track.pkl", "rb") as f:
-    int2track = pickle.load(f)
+def check_pickles_exist():
+    """Check if all required pickle files exist."""
+    return all(os.path.exists(path) for path in PICKLE_FILES.values())
 
-with open("feature_cols.pkl", "rb") as f:
-    feature_cols = pickle.load(f)
+def load_from_pickles():
+    """Load all data from pickle files."""
+    print("⏳ Loading from pickle files...")
+    data = {}
+    with open(PICKLE_FILES['track2int'], "rb") as f:
+        data['track2int'] = pickle.load(f)
+    with open(PICKLE_FILES['int2track'], "rb") as f:
+        data['int2track'] = pickle.load(f)
+    with open(PICKLE_FILES['feature_cols'], "rb") as f:
+        data['feature_cols'] = pickle.load(f)
+    with open(PICKLE_FILES['track2feat'], "rb") as f:
+        data['track2feat'] = pickle.load(f)
+    with open(PICKLE_FILES['track_meta'], "rb") as f:
+        data['track_meta'] = pickle.load(f)
+    print("✅ Pickle files loaded successfully.")
+    return data
 
-with open("track2feat.pkl", "rb") as f:
-    track2feat = pickle.load(f)
+def compute_and_save_pickles(csv_path):
+    """Compute vocabularies and features from CSV, then save as pickles."""
+    print("⏳ Reading CSV (this may take a while)...")
+    start = time.perf_counter()
+    playlists = pd.read_csv(csv_path, engine="pyarrow")
+    print(f'read_csv took {time.perf_counter() - start}s')
 
-with open("track_meta.pkl", "rb") as f:
-    track_meta = pickle.load(f)
+    # Fix NaNs (must match training preprocessing)
+    playlists["playlist_name"] = playlists["playlist_name"].fillna("").astype(str)
+
+    # Rebuild filled columns
+    for col in playlists.columns:
+        if col.endswith("_filled"):
+            base = col.replace("_filled", "")
+            if base in playlists.columns:
+                playlists[col] = playlists[base].fillna(0.0)
+            else:
+                playlists[col] = playlists[col].fillna(0.0)
+
+
+    # Reconstruct Vocabulary
+    print("⏳ Reconstructing Vocabulary...")
+    track_counts = playlists["track_id"].value_counts()
+    top_k_track_ids = track_counts.head(VOCAB_SIZE_K).index.tolist()
+    vocab_list = [UNK_TOKEN] + sorted(top_k_track_ids)
+    track2int = {tid: i for i, tid in enumerate(vocab_list)}
+    int2track = {i: tid for tid, i in track2int.items()}
+    
+    print(f"✅ Vocab Reconstructed. Size: {len(track2int)}")
+
+    # Build Feature Columns
+    print("⏳ Building feature column list...")
+    feature_cols = [
+        "danceability", "energy", "key", "loudness", "mode",
+        "year_filled", "popularity_filled", "explicit_filled",
+        "year_is_missing", "popularity_is_missing", "explicit_is_missing",
+        "speechiness", "acousticness", "instrumentalness", "liveness",
+        "valence", "tempo", "duration_ms", "time_signature",
+    ] + [c for c in playlists.columns if c.startswith("genre_")]
+    
+    print(f"✅ Built {len(feature_cols)} feature columns.")
+
+    # Build Feature Dictionary
+    print("⏳ Reconstructing Feature Dictionary...")
+    missing_cols = [c for c in feature_cols if c not in playlists.columns]
+    if missing_cols:
+        raise ValueError(f"❌ Missing required feature columns: {missing_cols}")
+
+    track_features_df = (
+        playlists
+        .drop_duplicates(subset=['track_id'])
+        .set_index('track_id')[feature_cols]
+    )
+
+    track2feat = {
+        tid: vals.astype("float32")
+        for tid, vals in zip(track_features_df.index, track_features_df.values)
+    }
+    
+    print(f"✅ Features Loaded. FEATURE_DIM = {len(feature_cols)}")
+
+    # Build Metadata
+    print("⏳ Building metadata lookup...")
+    meta_df = playlists.drop_duplicates(subset=['track_id']).set_index('track_id')[['track_name', 'artist_name']]
+    track_meta = {
+        tid: f"{row['track_name']} by {row['artist_name']}"
+        for tid, row in meta_df.iterrows()
+    }
+    
+    print("✅ Metadata reconstructed.")
+
+    # Save All Pickles
+    print("Saving preprocessed objects...")
+    with open(PICKLE_FILES['track2int'], "wb") as f:
+        pickle.dump(track2int, f)
+    with open(PICKLE_FILES['int2track'], "wb") as f:
+        pickle.dump(int2track, f)
+    with open(PICKLE_FILES['feature_cols'], "wb") as f:
+        pickle.dump(feature_cols, f)
+    with open(PICKLE_FILES['track2feat'], "wb") as f:
+        pickle.dump(track2feat, f)
+    with open(PICKLE_FILES['track_meta'], "wb") as f:
+        pickle.dump(track_meta, f)
+    
+    print("✅ All pickle files saved.")
+    
+    return {
+        'track2int': track2int,
+        'int2track': int2track,
+        'feature_cols': feature_cols,
+        'track2feat': track2feat,
+        'track_meta': track_meta,
+    }
+
+def load_or_compute_data(csv_path):
+    """
+    Load from pickles if they exist, otherwise compute and save them.
+    
+    Returns:
+        dict: Contains track2int, int2track, feature_cols, track2feat, track_meta
+    """
+    if check_pickles_exist():
+        return load_from_pickles()
+    else:
+        print("⚠️ Pickle files not found. Computing from CSV...")
+        return compute_and_save_pickles(csv_path)
+
+# 2. LOAD DATA (with caching)
+data = load_or_compute_data(CSV_PATH)
+
+track2int = data['track2int']
+int2track = data['int2track']
+feature_cols = data['feature_cols']
+track2feat = data['track2feat']
+track_meta = data['track_meta']
 
 VOCAB_SIZE = len(track2int)
 FEATURE_DIM = len(feature_cols)
@@ -39,7 +177,6 @@ FEATURE_DIM = len(feature_cols)
 # Recreate meta_df from track_meta
 meta_data = []
 for tid, meta_str in track_meta.items():
-    # Parse "track_name by artist_name" format
     if " by " in meta_str:
         track_name, artist_name = meta_str.rsplit(" by ", 1)
         meta_data.append({
@@ -50,14 +187,9 @@ for tid, meta_str in track_meta.items():
 
 meta_df = pd.DataFrame(meta_data).set_index('track_id')
 
-# ====================================================
 # 3. LOAD MODEL
-# ====================================================
 print("⏳ Loading Universal Sentence Encoder...")
 USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
-
-def encode_title(title_texts):
-    return USE(title_texts)
 
 print("⏳ Initializing Model...")
 EMB_DIM = 64
@@ -78,32 +210,16 @@ _ = model(dummy_feat, dummy_title, dummy_mask)
 # Load Checkpoint
 print("⏳ Restoring Weights...")
 checkpoint_dir = "./playlist_model_ckpts"
-checkpoint = tf.train.Checkpoint(
-    optimizer=tf.keras.optimizers.Adam(3e-4),
-    model=model
-)
+checkpoint = tf.train.Checkpoint(optimizer=tf.keras.optimizers.Adam(3e-4), model=model)
 latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
 
 if latest_checkpoint:
-    # IMPORTANT: assign status
     status = checkpoint.restore(latest_checkpoint).expect_partial()
     print(f"✅ Model weights restored from {latest_checkpoint}")
 else:
     print("❌ No checkpoint found. Check your directory path.")
 
-print("------------------------------------------------------")
-try:
-    status.assert_existing_objects_matched()
-    print("All checkpoint variables matched successfully.")
-except Exception as e:
-    print("⚠️ Mismatch detected:")
-    print(e)
-print("------------------------------------------------------")
-
-# ====================================================
 # 4. INFERENCE LOGIC
-# ====================================================
-
 def build_manual_batch(track_ids, track2feat, unk_id=0):
     valid_ids = [tid for tid in track_ids if (tid in track2int) and (tid in track2feat)]
     
@@ -200,19 +316,19 @@ def non_autoregressive_recommend_top_p(
         for idx in seen:
             logits[int(idx)] = -1e9
 
-    # ---- TEMPERATURE SCALING ----
+    # TEMPERATURE SCALING 
     scaled_logits = logits / temperature
 
-    # ---- SORT BY PROBABILITY ----
+    # SORT BY PROBABILITY 
     sorted_indices = np.argsort(scaled_logits)[::-1]
     sorted_logits = scaled_logits[sorted_indices]
 
-    # ---- CONVERT TO PROBABILITIES ----
+    # CONVERT TO PROBABILITIES
     # Subtract max for numerical stability
     probs = np.exp(sorted_logits - np.max(sorted_logits))
     probs = probs / probs.sum()
 
-    # ---- FIND NUCLEUS (cumulative probability <= top_p) ----
+    # FIND NUCLEUS (cumulative probability <= top_p)
     cumsum = np.cumsum(probs)
     cutoff_idx = np.searchsorted(cumsum, top_p) + 1
     
@@ -220,12 +336,12 @@ def non_autoregressive_recommend_top_p(
     cutoff_idx = min(cutoff_idx, len(sorted_indices))
     cutoff_idx = max(cutoff_idx, num_generated)  # At least num_generated songs
 
-    # ---- EXTRACT NUCLEUS ----
+    # EXTRACT NUCLEUS
     nucleus_indices = sorted_indices[:cutoff_idx]
     nucleus_probs = probs[:cutoff_idx]
     nucleus_probs = nucleus_probs / nucleus_probs.sum()  # Renormalize
 
-    # ---- SAMPLE WITHOUT REPLACEMENT ----
+    # SAMPLE WITHOUT REPLACEMENT 
     num_to_sample = min(num_generated, len(nucleus_indices))
     sampled = np.random.choice(
         nucleus_indices,
@@ -236,12 +352,9 @@ def non_autoregressive_recommend_top_p(
 
     return sampled.tolist()
 
-# ====================================================
+
 # 5. MANUAL "HUMAN TEST" PLAYLISTS
-#     Each run with:
-#       - ALLOW originals
-#       - EXCLUDE originals
-# ====================================================
+# NOTE: Each run with either ALLOW originals or EXCLUDE originals
 
 #tracks_df = playlists  # alias for readability
 
@@ -284,9 +397,8 @@ def run_human_test_not_autoreg(track_ids, title_text):
     # Convert originals to a Python set for fast lookup
     original_token_ids = set(playlist_song_ids.numpy().tolist())
 
-    # ======================================================
+
     # MODE A — ALLOW ORIGINALS
-    # ======================================================
     print("\n-- Initial Recommendations (ALLOW originals) --")
 
     rec_ids_allow = non_autoregressive_recommend(
@@ -304,9 +416,7 @@ def run_human_test_not_autoreg(track_ids, title_text):
         tid = int2track.get(int(rid), "UNKNOWN")
         print(" ➜", track_meta.get(tid, tid))
 
-    # ======================================================
     # Filter repeats (songs already in playlist)
-    # ======================================================
     unique_recs = [rid for rid in rec_ids_allow if rid not in original_token_ids]
     num_unique = len(unique_recs)
     num_missing = 10 - num_unique
@@ -318,9 +428,7 @@ def run_human_test_not_autoreg(track_ids, title_text):
     else:
         print(f"\nFound {10 - num_unique} repeat(s). Generating {num_missing} replacement(s)...")
 
-        # ======================================================
         # MODE B — EXCLUDE ORIGINALS (fill missing unique recs)
-        # ======================================================
         extra_recs = non_autoregressive_recommend(
             model=model,
             song_features=song_feats,
@@ -337,9 +445,7 @@ def run_human_test_not_autoreg(track_ids, title_text):
     # Ensure exactly 10 results
     final_recs = final_recs[:10]
 
-    # ======================================================
     # Print final output
-    # ======================================================
     print("\n====== FINAL 10 NON-REPEATED RECOMMENDATIONS ======")
     for rid in final_recs:
         tid = int2track.get(int(rid), "UNKNOWN")
@@ -370,9 +476,7 @@ def run_human_test_not_autoreg_top_p(track_ids, title_text):
     # Convert originals to a Python set for fast lookup
     original_token_ids = set(playlist_song_ids.numpy().tolist())
     
-    # ======================================================
     # MODE A — ALLOW ORIGINALS
-    # ======================================================
     print("\n-- Initial Recommendations (ALLOW originals) --")
     rec_ids_allow = non_autoregressive_recommend_top_p(
         model=model,
@@ -388,9 +492,7 @@ def run_human_test_not_autoreg_top_p(track_ids, title_text):
         tid = int2track.get(int(rid), "UNKNOWN")
         print(" ➜", track_meta.get(tid, tid))
     
-    # ======================================================
     # Filter repeats (songs already in playlist)
-    # ======================================================
     unique_recs = [rid for rid in rec_ids_allow if rid not in original_token_ids]
     num_unique = len(unique_recs)
     num_missing = 10 - num_unique
@@ -400,9 +502,8 @@ def run_human_test_not_autoreg_top_p(track_ids, title_text):
         final_recs = unique_recs
     else:
         print(f"\nFound {10 - num_unique} repeat(s). Generating {num_missing} replacement(s)...")
-        # ======================================================
+
         # MODE B — EXCLUDE ORIGINALS (fill missing unique recs)
-        # ======================================================
         extra_recs = non_autoregressive_recommend_top_p(
             model=model,
             song_features=song_feats,
@@ -417,9 +518,7 @@ def run_human_test_not_autoreg_top_p(track_ids, title_text):
     # Ensure exactly 10 results
     final_recs = final_recs[:10]
     
-    # ======================================================
     # Print final output
-    # ======================================================
     print("\n====== FINAL 10 NON-REPEATED RECOMMENDATIONS ======")
     for rid in final_recs:
         tid = int2track.get(int(rid), "UNKNOWN")
@@ -477,8 +576,6 @@ pop_ids = [
     "22mek4IiqubGD9ctzxc69s",
 ]
 
-#run_human_test(pop_ids, "Pop")
-#run_human_test_not_autoreg(pop_ids, "Pop")
 run_human_test_not_autoreg_top_p(pop_ids, "Pop")
 
 
@@ -535,11 +632,7 @@ rap_ids = [
     "5uQOauh47VFt3B2kV9kRXw",
 ]
 
-#run_human_test(rap_ids, "Rap")
-#run_human_test_not_autoreg(rap_ids, "Rap / Hip-hop")
 run_human_test_not_autoreg_top_p(rap_ids, "Rap / Hip-hop")
-
-
 
 # ====== Country PLAYLIST ======
 country_ids = [
@@ -591,8 +684,6 @@ country_ids = [
     "2SpEHTbUuebeLkgs9QB7Ue",
 ]
 
-#run_human_test(country_ids, "American country yeehaw")
-#run_human_test_not_autoreg(country_ids, "American country yeehaw")
 run_human_test_not_autoreg_top_p(country_ids, "American country yeehaw")
 
 
@@ -613,9 +704,7 @@ jazz_ids = [
     "4IbOPxstIn2KbdlWf5xRZ0",
 ]
 
-#run_human_test(jazz_ids, "Jazz")
-#run_human_test_not_autoreg(jazz_ids, "Jazz")
-
+run_human_test_not_autoreg(jazz_ids, "Jazz")
 
 
 # ====== Workout PLAYLIST ======
@@ -671,8 +760,6 @@ workout_ids = [
     "5B37ocpk2zxeZL1lq5F6ui",
 ]
 
-#run_human_test(workout_ids, "Workout")
-#run_human_test_not_autoreg(workout_ids, "Hype up workout")
 run_human_test_not_autoreg_top_p(workout_ids, "Hype up workout")
 
 
@@ -726,8 +813,6 @@ chill_ids = [
     "4OBZT9EnhYIV17t4pGw7ig",
 ]
 
-#run_human_test(chill_ids, "Chill slow vibes")
-#run_human_test_not_autoreg(chill_ids, "Chill slow vibes")
 run_human_test_not_autoreg_top_p(chill_ids, "Chill slow vibes")
 
 
@@ -796,11 +881,7 @@ hard_rock_ids = [
     "0K6yUnIKNsFtfIpTgGtcHm",
 ]
 
-#run_human_test(hard_rock_ids, "70s Hard Rock")
-#run_human_test_not_autoreg(hard_rock_ids, "70s Hard Rock")
 run_human_test_not_autoreg_top_p(hard_rock_ids, "70s Hard Rock")
-
-
 
 # ====== Latin PLAYLIST ======
 
@@ -866,6 +947,5 @@ taylor_swift_ids = [
     "6d9IiDcFxtFVIvt9pCqyGH",
     "2ULNeSomDxVNmdDy8VxEBU",
 ]
-#run_human_test(taylor_swift_ids, "Taylor Swift")
-#run_human_test_not_autoreg(taylor_swift_ids, "Taylor Swift")
 
+run_human_test_not_autoreg(taylor_swift_ids, "Taylor Swift")

@@ -254,20 +254,20 @@ def load_and_prepare_data(csv_path):
             print("🚨 **WARNING: NaN found in Song Features!**")
         break # Only check the first batch
 
-    with open("feature_cols.pkl", "wb") as f:
-        pickle.dump(feature_cols, f)
+    # with open("feature_cols.pkl", "wb") as f:
+    #     pickle.dump(feature_cols, f)
     
-    with open("track2int.pkl", "wb") as f:
-        pickle.dump(track2int, f) 
+    # with open("track2int.pkl", "wb") as f:
+    #     pickle.dump(track2int, f) 
 
-    with open("int2track.pkl", "wb") as f:
-        pickle.dump(int2track, f) 
+    # with open("int2track.pkl", "wb") as f:
+    #     pickle.dump(int2track, f) 
 
-    with open("track2feat.pkl", "wb") as f:
-        pickle.dump(track2feat, f)
+    # with open("track2feat.pkl", "wb") as f:
+    #     pickle.dump(track2feat, f)
     
-    with open("track_meta.pkl", "rb") as f:
-        pickle.dump(track_meta, f)
+    # with open("track_meta.pkl", "rb") as f:
+    #     pickle.dump(track_meta, f)
 
     return dataset, val_dataset, test_dataset, vocab_info
 
