@@ -125,7 +125,7 @@ This will:
 
 - Load and preprocess the data from the CSV
 - Build the model
-- Train and validate, saving checkpoints to `./playlist_model_ckpts/`
+- Train and validate, saving checkpoints and weights to `./playlist_model_ckpts/`
 - Save training history to `./playlist_model_ckpts/history.pkl`
 - Save additional TFRecord metrics!
 
@@ -197,9 +197,9 @@ _See the final report for quantitative and qualitative results._
 
 ## Final Resources
 
-- You can access our weights at [add link eventually]
+- You can access our most up to date weights at [add link eventually]
 - You can view our final reports at [add link eventually]
-- You can view our poster here [add link eventually]
+- You can view our poster here: [text](<Final Submission/Project Poster.pdf>)
 
 ## Authors
 
