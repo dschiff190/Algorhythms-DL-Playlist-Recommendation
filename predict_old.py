@@ -1,58 +1,94 @@
+"""
+Inference and Prediction Module
+
+This module provides utilities for loading trained models, reconstructing data,
+and generating playlist recommendations using the trained SetTransformer model.
+"""
 import pandas as pd
 import tensorflow as tf
-import numpy as np
 import tensorflow_hub as hub
+import numpy as np
 import os
 import datetime
 import time
 import pickle
-import random
 
 from src.model import PlaylistModel, build_song_encoder
 from src.train import encode_title
 
-# ====================================================
-# 2. Reconstruct data
-# ====================================================
+# Load data
+print("Reading CSV (this may take a while)...")
+start = time.perf_counter()
+playlists = pd.read_csv("playlist_song_features_FINAL_FULL.csv", engine="pyarrow")
+print(f'read_csv took {start - time.perf_counter()}')
 
+# Fix NaNs to match training preprocessing
+playlists["playlist_name"] = playlists["playlist_name"].fillna("").astype(str)
+
+# Rebuild filled columns
+for col in playlists.columns:
+    if col.endswith("_filled"):
+        base = col.replace("_filled", "")
+        if base in playlists.columns:
+            playlists[col] = playlists[base].fillna(0.0)
+        else:
+            playlists[col] = playlists[col].fillna(0.0)
+
+# Reconstruct vocabulary
+print("⏳ Reconstructing Vocabulary...")
+K = 30000 
 UNK_TOKEN = '<UNK>' 
-UNK_ID = 0  
+UNK_ID = 0
 
-with open("track2int.pkl", "rb") as f:
-    track2int = pickle.load(f)
-
-with open("int2track.pkl", "rb") as f:
-    int2track = pickle.load(f)
-
-with open("feature_cols.pkl", "rb") as f:
-    feature_cols = pickle.load(f)
-
-with open("track2feat.pkl", "rb") as f:
-    track2feat = pickle.load(f)
-
-with open("track_meta.pkl", "rb") as f:
-    track_meta = pickle.load(f)
+track_counts = playlists["track_id"].value_counts()
+top_k_track_ids = track_counts.head(K).index.tolist()
+vocab_list = [UNK_TOKEN] + sorted(top_k_track_ids)
+track2int = {tid: i for i, tid in enumerate(vocab_list)}
+int2track = {i: tid for tid, i in track2int.items()}
 
 VOCAB_SIZE = len(track2int)
+print(f"Vocab Reconstructed. Size: {VOCAB_SIZE}")
+
+# Load feature columns
+print("⏳ Loading feature column list used during training...")
+import pickle
+
+feature_cols = [
+        "danceability","energy","key","loudness","mode", "year_filled","popularity_filled","explicit_filled", "year_is_missing","popularity_is_missing", "explicit_is_missing", # ------------- removed popularity -------------------
+        "speechiness","acousticness","instrumentalness","liveness",
+        "valence","tempo","duration_ms","time_signature", 
+] + [c for c in playlists.columns if c.startswith("genre_")] # Add all genre columns
+
+# Reconstruct feature matrix
+print("⏳ Reconstructing Feature Dictionary with TRAINING columns...")
+missing_cols = [c for c in feature_cols if c not in playlists.columns]
+if missing_cols:
+    raise ValueError(f"Missing required feature columns: {missing_cols}")
+
+# Select only the columns in the exact original order
+track_features_df = (
+    playlists
+    .drop_duplicates(subset=['track_id'])
+    .set_index('track_id')[feature_cols]
+)
+
+track2feat = {
+    tid: vals.astype("float32")
+    for tid, vals in zip(track_features_df.index, track_features_df.values)
+}
+
 FEATURE_DIM = len(feature_cols)
+print(f"Features Loaded. FEATURE_DIM = {FEATURE_DIM}")
 
-# Recreate meta_df from track_meta
-meta_data = []
-for tid, meta_str in track_meta.items():
-    # Parse "track_name by artist_name" format
-    if " by " in meta_str:
-        track_name, artist_name = meta_str.rsplit(" by ", 1)
-        meta_data.append({
-            'track_id': tid,
-            'track_name': track_name,
-            'artist_name': artist_name
-        })
+# Load metadata lookup
+meta_df = playlists.drop_duplicates(subset=['track_id']).set_index('track_id')[['track_name', 'artist_name']]
+track_meta = {
+    tid: f"{row['track_name']} by {row['artist_name']}"
+    for tid, row in meta_df.iterrows()
+}
+print("Metadata reconstructed.")
 
-meta_df = pd.DataFrame(meta_data).set_index('track_id')
-
-# ====================================================
-# 3. LOAD MODEL
-# ====================================================
+# Initialize model
 print("⏳ Loading Universal Sentence Encoder...")
 USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
 
@@ -69,46 +105,31 @@ model = PlaylistModel(
     playlist_representation_sz=PLAYLIST_REPRESENTATION_SZ
 )
 
-# Build the model graph
+# Build the model graph with a dummy call
 dummy_feat = tf.zeros((1, 5, FEATURE_DIM))
 dummy_title = encode_title(["dummy"])
 dummy_mask = tf.ones((1, 5))
 _ = model(dummy_feat, dummy_title, dummy_mask)
 
-# Load Checkpoint
+# Load checkpoint
 print("⏳ Restoring Weights...")
 checkpoint_dir = "./playlist_model_ckpts"
-checkpoint = tf.train.Checkpoint(
-    optimizer=tf.keras.optimizers.Adam(3e-4),
-    model=model
-)
+checkpoint = tf.train.Checkpoint(optimizer=tf.keras.optimizers.Adam(3e-4), model=model)
 latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
 
 if latest_checkpoint:
-    # IMPORTANT: assign status
     status = checkpoint.restore(latest_checkpoint).expect_partial()
-    print(f"✅ Model weights restored from {latest_checkpoint}")
+    print(f"Model weights restored from {latest_checkpoint}")
 else:
     print("❌ No checkpoint found. Check your directory path.")
 
-print("------------------------------------------------------")
-try:
-    status.assert_existing_objects_matched()
-    print("All checkpoint variables matched successfully.")
-except Exception as e:
-    print("⚠️ Mismatch detected:")
-    print(e)
-print("------------------------------------------------------")
-
-# ====================================================
-# 4. INFERENCE LOGIC
-# ====================================================
+# Inference functions
 
 def build_manual_batch(track_ids, track2feat, unk_id=0):
     valid_ids = [tid for tid in track_ids if (tid in track2int) and (tid in track2feat)]
     
     if not valid_ids:
-        print("🚨 Error: None of the provided track IDs were found in the training vocabulary.")
+        print("Error: None of the provided track IDs were found in the training vocabulary.")
         return None, None, None, None
 
     token_ids = [track2int.get(tid, unk_id) for tid in valid_ids]
@@ -122,140 +143,91 @@ def build_manual_batch(track_ids, track2feat, unk_id=0):
     playlist_song_ids = tf.constant(token_ids, dtype=tf.int64)
     
     return song_features, mask, playlist_song_ids
-    
-def non_autoregressive_recommend(
+
+def autoregressive_recommend(
     model,
     song_features,
     title_text,
     mask,
     playlist_song_ids,
-    k=1000,
-    num_generated=10,
-    temperature=1.0,     
-    exclude_original=True
+    k=3,
+    num_generated=5,
+    exclude_original=True  
 ):
-    """
-    Top-k sampler with temperature.
-    Does NOT feed generated songs back into the model.
-    """
-    # Compute logits once
-    title_emb = encode_title([title_text])
-    logits = model(song_features, title_emb, mask, training=False)[0]  # shape [VOCAB]
+    sf = tf.identity(song_features)
+    m   = tf.identity(mask)
+    ids = tf.identity(playlist_song_ids)
 
-    # Exclude original playlist songs
-    if exclude_original:
-        seen = playlist_song_ids
-        exclude_mask = tf.scatter_nd(
-            tf.expand_dims(seen, 1),
-            tf.ones_like(seen, dtype=tf.float32),
-            shape=(logits.shape[0],)
-        )
-        logits = logits - 1e9 * exclude_mask
+    # Keep a separate handle on the original playlist length
+    orig_len = playlist_song_ids.shape[0]  
 
-    # ---- TOP-K ----
-    top_vals, top_idx = tf.math.top_k(logits, k=k)
-    top_idx = top_idx.numpy()                # shape (k,)
-    top_vals = top_vals.numpy().astype(float)
-
-    # ---- TEMPERATURE SCALING ----
-    scaled = top_vals / temperature
-
-    # ---- PROBABILITIES ----
-    probs = np.exp(scaled - np.max(scaled))
-    probs = probs / probs.sum()              # softmax
-
-    # ---- SAMPLE WITHOUT REPLACEMENT ----
-    sampled = np.random.choice(
-        top_idx,
-        size=num_generated,
-        replace=False,
-        p=probs
-    )
-
-    return sampled.tolist()
+    generated_ids = []
     
-def non_autoregressive_recommend_top_p(
-    model,
-    song_features,
-    title_text,
-    mask,
-    playlist_song_ids,
-    top_p=0.98,
-    num_generated=10,
-    temperature=1.0,
-    exclude_original=True
-):
-    """
-    Top-p (nucleus) sampler with temperature.
-    Does NOT feed generated songs back into the model.
-    """
-    # Compute logits once
-    title_emb = encode_title([title_text])
-    logits = model(song_features, title_emb, mask, training=False)[0]  # shape [VOCAB]
-    logits = logits.numpy().astype(float)
-
-    # Exclude original playlist songs
-    if exclude_original:
-        seen = playlist_song_ids.numpy() if hasattr(playlist_song_ids, 'numpy') else playlist_song_ids
-        for idx in seen:
-            logits[int(idx)] = -1e9
-
-    # ---- TEMPERATURE SCALING ----
-    scaled_logits = logits / temperature
-
-    # ---- SORT BY PROBABILITY ----
-    sorted_indices = np.argsort(scaled_logits)[::-1]
-    sorted_logits = scaled_logits[sorted_indices]
-
-    # ---- CONVERT TO PROBABILITIES ----
-    # Subtract max for numerical stability
-    probs = np.exp(sorted_logits - np.max(sorted_logits))
-    probs = probs / probs.sum()
-
-    # ---- FIND NUCLEUS (cumulative probability <= top_p) ----
-    cumsum = np.cumsum(probs)
-    cutoff_idx = np.searchsorted(cumsum, top_p) + 1
+    print(f"\nGenerative Process for '{title_text}':")
     
-    # Ensure we have enough songs for sampling
-    cutoff_idx = min(cutoff_idx, len(sorted_indices))
-    cutoff_idx = max(cutoff_idx, num_generated)  # At least num_generated songs
+    for step in range(num_generated):
+        title_emb = encode_title([title_text])
+        logits = model(sf, title_emb, m, training=False)[0]
 
-    # ---- EXTRACT NUCLEUS ----
-    nucleus_indices = sorted_indices[:cutoff_idx]
-    nucleus_probs = probs[:cutoff_idx]
-    nucleus_probs = nucleus_probs / nucleus_probs.sum()  # Renormalize
 
-    # ---- SAMPLE WITHOUT REPLACEMENT ----
-    num_to_sample = min(num_generated, len(nucleus_indices))
-    sampled = np.random.choice(
-        nucleus_indices,
-        size=num_to_sample,
-        replace=False,
-        p=nucleus_probs
-    )
+        # Determine which songs to exclude from recommendations
+        if exclude_original:
+            # Block both original and generated songs
+            seen = ids[ids >= 0]
+        else:
+            # Allow original songs, only block newly generated ones
+            seen = ids[orig_len:]
 
-    return sampled.tolist()
+        # Apply exclusion mask to logits
+        if tf.size(seen) > 0:
+            exclude_mask = tf.scatter_nd(
+                tf.expand_dims(seen, 1),
+                tf.ones_like(seen, dtype=tf.float32),
+                shape=(logits.shape[0],)
+            )
+            filtered_logits = logits - 1e9 * exclude_mask
+        else:
+            filtered_logits = logits
 
-# ====================================================
-# 5. MANUAL "HUMAN TEST" PLAYLISTS
-#     Each run with:
-#       - ALLOW originals
-#       - EXCLUDE originals
-# ====================================================
+        # Top-k sampling
+        _, top_k_indices = tf.math.top_k(filtered_logits, k=k)
+        chosen_token = np.random.choice(top_k_indices.numpy())
+        
+        generated_ids.append(chosen_token)
+        chosen_tid = int2track.get(chosen_token, "UNKNOWN")
 
-#tracks_df = playlists  # alias for readability
+        # Update tracking of ids (used for masking & features)
+        ids = tf.concat([ids, [chosen_token]], axis=0)
+        
+        # Add new feature row for the chosen song
+        if chosen_tid in track2feat:
+            new_feat = tf.constant(track2feat[chosen_tid], dtype=tf.float32)
+            new_feat = tf.reshape(new_feat, (1, 1, -1))
+            sf = tf.concat([sf, new_feat], axis=1)
+            m  = tf.concat([m, [[1]]], axis=1)
+            
+            track_name = track_meta.get(chosen_tid, "Unknown Title")
+            print(f"  Step {step+1}: Added → {track_name}")
+        else:
+            print(f"  Step {step+1}: Added Token {chosen_token} (Feature lookup failed)")
+
+    return generated_ids
+
+# Test playlists
+tracks_df = playlists
 
 def pretty_print_playlist(playlist_song_ids, title_label):
-    print("\n======================================")
-    print("=== MANUAL HUMAN TEST PLAYLIST ===")
-    print("Title:", title_label)
+    print("\n" + "="*40)
+    print(f"Playlist: {title_label}")
+    print("="*40)
 
     original_token_ids = playlist_song_ids.numpy().tolist()
     original_track_ids = [int2track[int(tok)] for tok in original_token_ids]
 
     print("\nSongs already in playlist:")
 
-    seen = set()  # optional: avoid printing duplicates if the seed list itself repeats
+    # optional: avoid printing duplicates if the seed list itself repeats
+    seen = set()  
     for tid in original_track_ids:
         if tid in seen:
             continue
@@ -267,8 +239,8 @@ def pretty_print_playlist(playlist_song_ids, title_label):
         else:
             print(f" • {tid} (metadata not found)")
 
-def run_human_test_not_autoreg(track_ids, title_text):
-    # Build input batch
+
+def run_human_test(track_ids, title_text):
     song_feats, mask, playlist_song_ids = build_manual_batch(
         track_ids=track_ids,
         track2feat=track2feat,
@@ -280,33 +252,27 @@ def run_human_test_not_autoreg(track_ids, title_text):
         return
 
     pretty_print_playlist(playlist_song_ids, title_text)
-
-    # Convert originals to a Python set for fast lookup
     original_token_ids = set(playlist_song_ids.numpy().tolist())
 
-    # ======================================================
-    # MODE A — ALLOW ORIGINALS
-    # ======================================================
+   
+    # Mode 1: allow originals to be seen 
     print("\n-- Initial Recommendations (ALLOW originals) --")
-
-    rec_ids_allow = non_autoregressive_recommend(
+    rec_ids_allow = autoregressive_recommend(
         model=model,
         song_features=song_feats,
         title_text=title_text,
         mask=mask,
         playlist_song_ids=playlist_song_ids,
-        k=1000,            # top-k window
+        k=20,
         num_generated=10,
-        exclude_original=False,   # ALLOW originals first
+        exclude_original=False,
     )
 
     for rid in rec_ids_allow:
         tid = int2track.get(int(rid), "UNKNOWN")
         print(" ➜", track_meta.get(tid, tid))
 
-    # ======================================================
-    # Filter repeats (songs already in playlist)
-    # ======================================================
+    # Filter out repeats
     unique_recs = [rid for rid in rec_ids_allow if rid not in original_token_ids]
     num_unique = len(unique_recs)
     num_missing = 10 - num_unique
@@ -314,120 +280,35 @@ def run_human_test_not_autoreg(track_ids, title_text):
     if num_missing == 0:
         print("\n(No repeats — already 10 unique recommendations.)")
         final_recs = unique_recs
-
     else:
         print(f"\nFound {10 - num_unique} repeat(s). Generating {num_missing} replacement(s)...")
 
-        # ======================================================
-        # MODE B — EXCLUDE ORIGINALS (fill missing unique recs)
-        # ======================================================
-        extra_recs = non_autoregressive_recommend(
+        # Mode 2: exclude originals in playlist
+        extra_recs = autoregressive_recommend(
             model=model,
             song_features=song_feats,
             title_text=title_text,
             mask=mask,
             playlist_song_ids=playlist_song_ids,
-            k=1000,
+            k=20,
             num_generated=num_missing,
-            exclude_original=True,     # avoid original playlist songs
+            exclude_original=True,
         )
 
         final_recs = unique_recs + extra_recs
 
-    # Ensure exactly 10 results
+    # Safety: ensure final list has exactly 10
     final_recs = final_recs[:10]
 
-    # ======================================================
-    # Print final output
-    # ======================================================
-    print("\n====== FINAL 10 NON-REPEATED RECOMMENDATIONS ======")
+    print("\n" + "="*40)
+    print("FINAL 10 RECOMMENDATIONS")
+    print("="*40)
     for rid in final_recs:
         tid = int2track.get(int(rid), "UNKNOWN")
         print(" ➜", track_meta.get(tid, tid))
-        
-        
-def run_human_test_not_autoreg_top_p(track_ids, title_text):
-    """
-    Run human test with top-p sampling.
-    Uses settings defined in non_autoregressive_recommend_top_p.
-    
-    Args:
-        track_ids: List of track IDs for the input playlist
-        title_text: Playlist title
-    """
-    # Build input batch
-    song_feats, mask, playlist_song_ids = build_manual_batch(
-        track_ids=track_ids,
-        track2feat=track2feat,
-        unk_id=UNK_ID,
-    )
-    if song_feats is None:
-        print(f"Skipping playlist '{title_text}' — no valid tracks.")
-        return
-    
-    pretty_print_playlist(playlist_song_ids, title_text)
-    
-    # Convert originals to a Python set for fast lookup
-    original_token_ids = set(playlist_song_ids.numpy().tolist())
-    
-    # ======================================================
-    # MODE A — ALLOW ORIGINALS
-    # ======================================================
-    print("\n-- Initial Recommendations (ALLOW originals) --")
-    rec_ids_allow = non_autoregressive_recommend_top_p(
-        model=model,
-        song_features=song_feats,
-        title_text=title_text,
-        mask=mask,
-        playlist_song_ids=playlist_song_ids,
-        num_generated=10,
-        exclude_original=False,   # ALLOW originals first
-    )
-    
-    for rid in rec_ids_allow:
-        tid = int2track.get(int(rid), "UNKNOWN")
-        print(" ➜", track_meta.get(tid, tid))
-    
-    # ======================================================
-    # Filter repeats (songs already in playlist)
-    # ======================================================
-    unique_recs = [rid for rid in rec_ids_allow if rid not in original_token_ids]
-    num_unique = len(unique_recs)
-    num_missing = 10 - num_unique
-    
-    if num_missing == 0:
-        print("\n(No repeats — already 10 unique recommendations.)")
-        final_recs = unique_recs
-    else:
-        print(f"\nFound {10 - num_unique} repeat(s). Generating {num_missing} replacement(s)...")
-        # ======================================================
-        # MODE B — EXCLUDE ORIGINALS (fill missing unique recs)
-        # ======================================================
-        extra_recs = non_autoregressive_recommend_top_p(
-            model=model,
-            song_features=song_feats,
-            title_text=title_text,
-            mask=mask,
-            playlist_song_ids=playlist_song_ids,
-            num_generated=num_missing,
-            exclude_original=True,     # avoid original playlist songs
-        )
-        final_recs = unique_recs + extra_recs
-    
-    # Ensure exactly 10 results
-    final_recs = final_recs[:10]
-    
-    # ======================================================
-    # Print final output
-    # ======================================================
-    print("\n====== FINAL 10 NON-REPEATED RECOMMENDATIONS ======")
-    for rid in final_recs:
-        tid = int2track.get(int(rid), "UNKNOWN")
-        print(" ➜", track_meta.get(tid, tid))
-
-
 
 # ====== Pop PLAYLIST ======
+
 pop_ids = [
     "5Q0Nhxo0l2bP3pNjpGJwV1",
     "1Slwb6dOYkBlWal1PGtnNg",
@@ -477,10 +358,7 @@ pop_ids = [
     "22mek4IiqubGD9ctzxc69s",
 ]
 
-#run_human_test(pop_ids, "Pop")
-#run_human_test_not_autoreg(pop_ids, "Pop")
-run_human_test_not_autoreg_top_p(pop_ids, "Pop")
-
+run_human_test(pop_ids, "Pop")
 
 # ====== Rap PLAYLIST ======
 rap_ids = [
@@ -533,13 +411,10 @@ rap_ids = [
     "5qxChyzKLEyoPJ5qGrdurN",
     "5uZm7EFtP5aoTJvx5gv9Xf",
     "5uQOauh47VFt3B2kV9kRXw",
+
 ]
 
-#run_human_test(rap_ids, "Rap")
-#run_human_test_not_autoreg(rap_ids, "Rap / Hip-hop")
-run_human_test_not_autoreg_top_p(rap_ids, "Rap / Hip-hop")
-
-
+run_human_test(rap_ids, "Rap")
 
 # ====== Country PLAYLIST ======
 country_ids = [
@@ -591,10 +466,7 @@ country_ids = [
     "2SpEHTbUuebeLkgs9QB7Ue",
 ]
 
-#run_human_test(country_ids, "American country yeehaw")
-#run_human_test_not_autoreg(country_ids, "American country yeehaw")
-run_human_test_not_autoreg_top_p(country_ids, "American country yeehaw")
-
+run_human_test(country_ids, "American country yeehaw")
 
 # ====== Jazz PLAYLIST ======
 jazz_ids = [
@@ -613,9 +485,7 @@ jazz_ids = [
     "4IbOPxstIn2KbdlWf5xRZ0",
 ]
 
-#run_human_test(jazz_ids, "Jazz")
-#run_human_test_not_autoreg(jazz_ids, "Jazz")
-
+run_human_test(jazz_ids, "Jazz")
 
 
 # ====== Workout PLAYLIST ======
@@ -671,9 +541,7 @@ workout_ids = [
     "5B37ocpk2zxeZL1lq5F6ui",
 ]
 
-#run_human_test(workout_ids, "Workout")
-#run_human_test_not_autoreg(workout_ids, "Hype up workout")
-run_human_test_not_autoreg_top_p(workout_ids, "Hype up workout")
+run_human_test(workout_ids, "Workout")
 
 
 # ====== Chill PLAYLIST ======
@@ -726,9 +594,7 @@ chill_ids = [
     "4OBZT9EnhYIV17t4pGw7ig",
 ]
 
-#run_human_test(chill_ids, "Chill slow vibes")
-#run_human_test_not_autoreg(chill_ids, "Chill slow vibes")
-run_human_test_not_autoreg_top_p(chill_ids, "Chill slow vibes")
+run_human_test(chill_ids, "Chill slow vibes")
 
 
 # ====== 70's Hard Rock PLAYLIST ======
@@ -796,11 +662,7 @@ hard_rock_ids = [
     "0K6yUnIKNsFtfIpTgGtcHm",
 ]
 
-#run_human_test(hard_rock_ids, "70s Hard Rock")
-#run_human_test_not_autoreg(hard_rock_ids, "70s Hard Rock")
-run_human_test_not_autoreg_top_p(hard_rock_ids, "70s Hard Rock")
-
-
+run_human_test(hard_rock_ids, "70s Hard Rock")
 
 # ====== Latin PLAYLIST ======
 
@@ -820,9 +682,7 @@ latin_ids = [
     "07U5izMEcWaETGct9nhhAg",
 ]
 
-#run_human_test(latin_ids, "Latin")
-#run_human_test_not_autoreg(latin_ids, "Latin")
-
+run_human_test(latin_ids, "Latin")
 
 
 # ====== Christmas PLAYLIST ======
@@ -844,9 +704,7 @@ christmas_ids = [
     "4ricyQVd20UQde1jpXCSuJ",
 ]
 
-#run_human_test(christmas_ids, "Christmas")
-#run_human_test_not_autoreg(christmas_ids, "Christmas")
-
+run_human_test(christmas_ids, "Christmas")
 
 # ====== Taylor Swift PLAYLIST ======
 
@@ -866,6 +724,4 @@ taylor_swift_ids = [
     "6d9IiDcFxtFVIvt9pCqyGH",
     "2ULNeSomDxVNmdDy8VxEBU",
 ]
-#run_human_test(taylor_swift_ids, "Taylor Swift")
-#run_human_test_not_autoreg(taylor_swift_ids, "Taylor Swift")
-
+run_human_test(taylor_swift_ids, "Taylor Swift")
