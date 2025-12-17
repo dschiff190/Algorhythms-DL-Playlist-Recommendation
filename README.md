@@ -64,8 +64,8 @@ The model is trained as a denoising autoencoder: random songs are masked from th
 
 ## Hyperparameters
 
-- **Embedding dimension (song & title):** 64
-- **Playlist representation size:** 64
+- **Embedding dimension (song & title):** 128
+- **Playlist representation size:** 128
 - **Set Transformer layers:** 3 SAB layers
 - **Attention heads:** 4 per SAB/PMA
 - **Dropout rate:** 0.1
