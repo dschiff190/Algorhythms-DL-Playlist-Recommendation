@@ -5,7 +5,7 @@ This project is for Brown University's CSCI 1470: Deep Learning course. We use d
 <p align="center">
   <img src="https://github.com/user-attachments/assets/d040c68d-4ca6-4ce7-9b37-879598e95524" width="400">
 </p>
-Our goal was to create a system like this one using transformers!
+Our goal was to create a system like this one from Spotify using transformers!
 
 ## Abstract:
 
