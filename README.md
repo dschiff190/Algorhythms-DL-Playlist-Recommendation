@@ -197,9 +197,9 @@ _See the final report for quantitative and qualitative results._
 
 ## Final Resources
 
-- You can access our most up to date weights at [add link eventually]
-- You can view our final reports at [add link eventually]
-- You can view our poster here: [text](<Final Submission/Project Poster.pdf>)
+- You can access our most up to date weights [in this folder](https://drive.google.com/drive/folders/1X07W8yFwMdiqICWyizsNWnoklUdCHlve?usp=sharing)
+- You can read our final report [here](https://drive.google.com/file/d/1K6jCn7-eLAahGI9Gyq2hqPCO2I4ZWFqJ/view?usp=sharing)
+- You can view our poster: [here](<Final Submission/Project Poster.pdf>)
 
 ## Authors
 
